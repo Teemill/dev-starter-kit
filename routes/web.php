@@ -20,3 +20,10 @@ Route
     ->get('/mission', function () {
         return view('mission');
     });
+
+// routes to return image URLs
+Route::get("images/asc", "ImagesController@asc");
+
+Route::get("images/desc", "ImagesController@desc");
+
+Route::get("images/random", "ImagesController@random");
