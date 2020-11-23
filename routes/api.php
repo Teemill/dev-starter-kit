@@ -20,3 +20,10 @@ Route::middleware('auth:api')->get('/user', function (Request $request) {
 Route::get('api-test', function () {
     return response('Hello from the API');
 });
+
+Route::get('images/asc', "ImagesController@asc");
+
+Route::get('images/desc', "ImagesController@desc");
+
+Route::get('images/random', "ImagesController@random");
+

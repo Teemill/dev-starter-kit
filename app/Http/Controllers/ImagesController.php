@@ -7,10 +7,10 @@ use Illuminate\Http\Request;
 class ImagesController extends Controller
 {
     private $images = [
-        "firstfilename",
-        "secondfilename",
-        "thirdfilename",
-        "fourthfilename"
+        "/storage/images/butterfly.jpg",
+        "/storage/images/cat.jpg",
+        "/storage/images/dog.jpg",
+        "/storage/images/goldfish.jpg"
     ];
 
     //ascending order

@@ -21,9 +21,15 @@ Route
         return view('mission');
     });
 
-// routes to return image URLs
-Route::get("images/asc", "ImagesController@asc");
+// routes to return views for different image ordering
+Route::get("images/asc", function() {
+    return view("ascending");
+});
 
-Route::get("images/desc", "ImagesController@desc");
+Route::get("images/desc", function() {
+    return view("descending");
+});
 
-Route::get("images/random", "ImagesController@random");
+Route::get("images/random", function() {
+    return view("random");
+});
