@@ -6,7 +6,8 @@ Vue.use(VueRouter);
 let routes = [
     {
         path: "/images/:ordering",
-        component: require("./components/ImagesDisplay.vue").default
+        component: require("./components/ImagesDisplay.vue").default,
+        props: true
     },
     {
         path: "/animals/list/",
