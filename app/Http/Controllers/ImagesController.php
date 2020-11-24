@@ -12,7 +12,8 @@ define("NUM_OF_IMAGES", 4);
 class ImagesController extends Controller
 {
     //ascending order
-    public function asc() {
+    public function asc() 
+    {
         $ascending_images = $this->retrieve_image_urls(NUM_OF_IMAGES);
         sort($ascending_images);
 
@@ -20,7 +21,8 @@ class ImagesController extends Controller
     }
 
     //descending order
-    public function desc() {
+    public function desc() 
+    {
         $descending_images = $this->retrieve_image_urls(NUM_OF_IMAGES);
         rsort($descending_images);
 
@@ -28,7 +30,8 @@ class ImagesController extends Controller
     }
 
     //random order
-    public function random() {
+    public function random() 
+    {
         $random_images = $this->retrieve_image_urls(NUM_OF_IMAGES);
         shuffle($random_images);
 
@@ -39,7 +42,8 @@ class ImagesController extends Controller
     /* for each image path, check for Zone Identifier ADS, then remove /public/ and prepend /storage/
     *  to get the public URL, then return $num_of_images images from the final array
     */
-    private function retrieve_image_urls($num_of_images) {
+    private function retrieve_image_urls($num_of_images) 
+    {
         $image_paths = Storage::files("public/images");
         $urls = [];
 
@@ -52,8 +56,7 @@ class ImagesController extends Controller
                 array_push($urls, $url);
             }
         }
-
-        Log::info($urls);
+        
         return array_slice($urls, 0, $num_of_images);
     }
 
