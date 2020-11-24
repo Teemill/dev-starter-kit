@@ -11,25 +11,18 @@
 |
 */
 
-Route::get('/', function () {
-    return view('welcome');
-});
-
 Route
     ::name('mission')
     ->get('/mission', function () {
         return view('mission');
     });
 
-// routes to return views for different image ordering
-Route::get("images/asc", function() {
-    return view("ascending");
+Route::get("/{any?}", function() {
+    return view("home");
 });
 
-Route::get("images/desc", function() {
-    return view("descending");
+/*
+Route::get('/', function () {
+    return view('welcome');
 });
-
-Route::get("images/random", function() {
-    return view("random");
-});
+*/

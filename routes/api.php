@@ -27,3 +27,6 @@ Route::get('images/desc', "ImagesController@desc");
 
 Route::get('images/random', "ImagesController@random");
 
+Route::get('animals/list', "AnimalController@alphabetical");
+
+Route::get('animals/get/{animal_id}', "AnimalController@retrieve");
