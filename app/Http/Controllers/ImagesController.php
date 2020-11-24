@@ -6,6 +6,8 @@ use Illuminate\Http\Request;
 
 class ImagesController extends Controller
 {
+    /* TODO: retrieve image paths from storage instead of hard coded
+    */
     private $images = [
         "/storage/images/butterfly.jpg",
         "/storage/images/cat.jpg",
@@ -36,4 +38,5 @@ class ImagesController extends Controller
 
         return $randomImages;
     }
+
 }

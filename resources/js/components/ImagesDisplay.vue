@@ -6,6 +6,13 @@
 
 <script>
     export default {
+        props: {
+            ordering: {
+                type: String,
+                default: "asc"
+            }
+        },
+
         data: function () {
             return {
                 images: {
@@ -17,7 +24,7 @@
 
         created: function() {
             axios
-                .get("/api/images/asc")
+                .get("/api/images/" + this.ordering)
                 .then((response) => {
                     this.images = response.data;
                 })

@@ -5,16 +5,8 @@ Vue.use(VueRouter);
 
 let routes = [
     {
-        path: "/images/asc",
-        component: require("./components/AscendingImages.vue").default
-    },
-    {
-        path: "/images/desc",
-        component: require("./components/DescendingImages.vue").default
-    },
-    {
-        path: "/images/random",
-        component: require("./components/RandomImages.vue").default
+        path: "/images/:ordering",
+        component: require("./components/ImagesDisplay.vue").default
     },
     {
         path: "/animals/list/",
