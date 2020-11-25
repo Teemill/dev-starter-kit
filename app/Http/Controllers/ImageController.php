@@ -9,7 +9,7 @@ use Illuminate\Support\Facades\Log;
 //constant for number of images to retrieve
 define("NUM_OF_IMAGES", 4);
 
-class ImagesController extends Controller
+class ImageController extends Controller
 {
     //ascending order
     public function asc() 
