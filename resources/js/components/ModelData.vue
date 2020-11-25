@@ -2,10 +2,10 @@
     <div>
         <table>
             <tr>
-                <th><b>Animals</b></th>
+                <th v-for="(value, name) in model" :key="value.id"><b>{{ name }}</b></th>
             </tr>
-            <tr v-for="animal in animals" :key="animal.id">
-                <td>{{ animal.name }} </td>
+            <tr>
+                <td v-for="value in model" :key="value.id">{{ value }} </td>
             </tr>
         </table>
     </div>
@@ -13,20 +13,21 @@
 
 <script>
     export default {
+        props: [ "model_name", "model_id" ],
+
         data: function () {
             return {
-                animals: {
-                    type: Array,
-                    default: []
+                model: function() {
+                    return {};
                 }
             };
         },
 
         created: function() {
             axios
-                .get("/api/animals/list")
+                .get("/api/" + this.model_name + "/get/" + this.model_id)
                 .then((response) => {
-                    this.animals = response.data;
+                    this.model = response.data;
                 })
                 .catch((error) => {
                     console.log(error);
