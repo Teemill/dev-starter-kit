@@ -21,12 +21,19 @@ Route::get('api-test', function () {
     return response('Hello from the API');
 });
 
-Route::get('images/asc', "ImagesController@asc");
+// image api routes
+Route::get('images/asc', "ImageController@asc");
 
-Route::get('images/desc', "ImagesController@desc");
+Route::get('images/desc', "ImageController@desc");
 
-Route::get('images/random', "ImagesController@random");
+Route::get('images/random', "ImageController@random");
 
+// animal api routes
 Route::get('animals/list', "AnimalController@alphabetical");
 
 Route::get('animals/get/{animal_id}', "AnimalController@retrieve");
+
+// car api routes
+Route::get('cars/list', "CarController@index");
+
+Route::get('cars/get/{id}', "CarController@retrieve");

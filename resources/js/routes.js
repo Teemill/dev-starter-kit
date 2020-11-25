@@ -10,12 +10,13 @@ let routes = [
         props: true
     },
     {
-        path: "/animals/list/",
-        component: require("./components/AnimalList.vue").default
+        path: "/:model_name/list/",
+        component: require("./components/ModelList.vue").default,
+        props: true
     },
     {
-        path: "/animals/get/:animal_id",
-        component: require("./components/AnimalData.vue").default,
+        path: "/:model_name/get/:model_id",
+        component: require("./components/ModelData.vue").default,
         props: true
     }
 ]
