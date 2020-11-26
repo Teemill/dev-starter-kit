@@ -36,6 +36,10 @@ let routes = [
     {
         path: "/checkout",
         component: require("./components/Checkout.vue").default
+    },
+    {
+        path: "/receipt",
+        component: require("./components/Receipt.vue").default
     }
 ]
 

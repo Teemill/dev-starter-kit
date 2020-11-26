@@ -35,6 +35,7 @@ export default {
                 .post("/api/order", this.cart)
                 .then((response) => {
                     console.log(response);
+                    this.cart = [];
                     window.location.href = "#/receipt"
                 })
                 .catch((error) => {
