@@ -2,12 +2,19 @@
     <div>
         <table>
             <tr>
-                <th v-for="(value, name) in model" :key="value.id"><b>{{ name }}</b></th>
+                <th v-for="(data, heading) in model" :key="heading.id">
+                    <b> {{ formatHeading(heading) }} </b>
+                </th>
             </tr>
             <tr>
-                <td v-for="value in model" :key="value.id">{{ value }} </td>
+                <td v-for="(data) in model" :key="formatData(data.id)">
+                    {{ formatData(data) }}
+                </td>
             </tr>
         </table>
+        <div class="center">
+            <button class="button" @click="addToCart">Buy</button>
+        </div>
     </div>
 </template>
 
@@ -24,14 +31,43 @@
         },
 
         created: function() {
-            axios
-                .get("/api/" + this.model_name + "/get/" + this.model_id)
-                .then((response) => {
-                    this.model = response.data;
-                })
-                .catch((error) => {
-                    console.log(error);
-                })
+            this.loadData();
+        },
+
+        methods: {
+            loadData: function() {
+                axios
+                    .get("/api/" + this.model_name + "/get/" + this.model_id)
+                    .then((response) => {
+                        this.model = response.data.data;
+                    })
+                    .catch((error) => {
+                        console.log(error);
+                    })
+            },
+
+            formatHeading: function(heading) {
+                let finalStringArray = [];
+                let splitHeading = heading.split("_");
+                
+                for (let word of splitHeading) {
+                    finalStringArray.push(word.charAt(0).toUpperCase() + word.slice(1));
+                }
+
+                return finalStringArray.join(" ");
+            },
+
+            formatData: function(data) {
+                let finalData = "";
+
+                if (typeof data == "object") {
+                    finalData = data["name"];
+                } else {
+                    finalData = data;
+                }
+
+                return finalData;
+            }
         }
     }
 </script>
