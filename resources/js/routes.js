@@ -32,6 +32,10 @@ let routes = [
         path: "/:model_name/analytics/",
         component: require("./components/CarAnalytics.vue").default,
         props: true
+    },
+    {
+        path: "/checkout",
+        component: require("./components/Checkout.vue").default
     }
 ]
 

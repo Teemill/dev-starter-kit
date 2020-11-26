@@ -15,6 +15,10 @@
                 text-align: center;
             }
 
+            h3 {
+                color: #005BFF
+            }
+
             label {
                 text-align: right;
             }
@@ -87,6 +91,17 @@
             input {
                 width: 100%;
             }
+
+            .row {
+                white-space: nowrap;
+            }
+
+            .row > div {
+                width: auto;
+                height: auto;
+                display: inline-block;
+            }
+
         </style>
     </head>
 

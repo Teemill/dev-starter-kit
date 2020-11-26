@@ -13,7 +13,7 @@
             </tr>
         </table>
         <div class="center">
-            <button class="button" @click="addToCart">Buy</button>
+            <button class="button" @click="addToCart">Add to cart</button>
         </div>
     </div>
 </template>
@@ -67,6 +67,10 @@
                 }
 
                 return finalData;
+            },
+
+            addToCart: function() {
+                this.$store.commit("addToCart", this.model);
             }
         }
     }
