@@ -17,4 +17,9 @@ class Car extends Model
     {
         return $this->hasOne("App\FuelType");
     }
+
+    public function orders()
+    {
+        return $this->belongsToMany("App\Order");
+    }
 }

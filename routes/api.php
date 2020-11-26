@@ -40,3 +40,5 @@ Route::get('manufacturers/list', "ManufacturerController@index");
 Route::get("manufacturers/data", "ManufacturerController@data");
 Route::get('fuel_types/list', "FuelTypeController@index");
 Route::get("fuel_types/data", "FuelTypeController@data");
+
+Route::post("order", "OrderController@place");
