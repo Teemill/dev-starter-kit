@@ -6,6 +6,8 @@ use Illuminate\Http\Request;
 use App\Car;
 use App\Manufacturer;
 use App\FuelType;
+use App\Http\Resources\CarResource;
+use Illuminate\Support\Facades\Log;
 
 class CarController extends Controller
 {
@@ -38,13 +40,45 @@ class CarController extends Controller
             }
         }
 
-        return $cars;
+        return CarResource::collection($cars);
     }
 
     public function retrieve($id) 
     {
         $car = Car::findOrFail($id);
 
-        return $car;
+        return new CarResource($car);
+    }
+
+    public function store() 
+    {
+        $validatedData = request()->validate([
+            "name" => "required",
+            "manufacturer_id" => "required",
+            "fuel_type_id" => "required",
+            "seats" => "required",
+            "doors" => "required",
+            "top_speed" => "required"
+        ]);
+
+        $newCar = Car::create([
+            "name" => $validatedData["name"],
+            "fuel_type_id" => $validatedData["fuel_type_id"],
+            "manufacturer_id" => $validatedData["manufacturer_id"],
+            "seats" => $validatedData["seats"],
+            "doors" => $validatedData["doors"],
+            "top_speed" => $validatedData["top_speed"]
+        ]);
+
+        $newCar->save();
+    }
+
+
+    //should return a response representing the counts for each of the properties of a given type
+    //e.g. all manufacturers 
+    public function countOn($property) {
+        $manufacturers = Manufacturer::all();
+
+        $cars = Car::all();
     }
 }

@@ -5,6 +5,10 @@ Vue.use(VueRouter);
 
 let routes = [
     {
+        path: "/",
+        component: require("./components/Navigation.vue").default
+    },
+    {
         path: "/images/:ordering",
         component: require("./components/ImagesDisplay.vue").default,
         props: true
@@ -17,6 +21,16 @@ let routes = [
     {
         path: "/:model_name/get/:model_id",
         component: require("./components/ModelData.vue").default,
+        props: true
+    },
+    {
+        path: "/:model_name/new/",
+        component: require("./components/AddModel.vue").default,
+        props: true
+    },
+    {
+        path: "/:model_name/analytics/",
+        component: require("./components/CarAnalytics.vue").default,
         props: true
     }
 ]
