@@ -4,7 +4,7 @@
             <router-link tag="img" to="/checkout" :src="iconPath" alt="shopping cart"></router-link>
         </div>
         <div>
-            <h3 v-if="itemsInCart > 0">{{ itemsInCart }}</h3>
+            <h3>{{ itemsInCart }}</h3>
         </div>
     </div>
 </template>

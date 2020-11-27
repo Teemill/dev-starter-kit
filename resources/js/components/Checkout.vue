@@ -32,11 +32,10 @@ export default {
     methods: {
         placeOrder: function() {
             axios
-                .post("/api/order", this.cart)
+                .post("/api/orders", this.cart)
                 .then((response) => {
-                    console.log(response);
-                    this.cart = [];
-                    window.location.href = "#/receipt"
+                    this.$store.commit("clearCart");
+                    window.location.href = "#/orders/" + response.data;
                 })
                 .catch((error) => {
                     console.log(error);

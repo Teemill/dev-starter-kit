@@ -22,6 +22,7 @@ class CreateOrdersTable extends Migration
             $table->bigIncrements('id');
             $table->unsignedBigInteger("car_id");
             $table->unsignedBigInteger("order_id");
+            $table->timeStamp("order_made_at");
             $table->timestamps();
         });
     }

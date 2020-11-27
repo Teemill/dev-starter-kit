@@ -32,11 +32,52 @@ Vue.component('animal-data', require('./components/AnimalData.vue').default);
  * or customize the JavaScript scaffolding to fit your unique needs.
  */
 import router from "./routes";
+import Vuex from "vuex";
+
+Vue.use(Vuex);
 
 Vue.component('example-component', require('./components/ExampleComponent.vue').default);
+Vue.component('shopping-cart', require('./components/CartComponent.vue').default);
+
+const store = new Vuex.Store({
+    state: {
+        items: []
+    },
+
+    mutations: {
+        addToCart(state, item) {
+            state.items.push({
+                id: item.id,
+                name: item.name,
+            })
+        },
+
+        // checks the cart array for the given item, if found then:
+        // if the quantity (count) is > 1, then the quantity is reduced,
+        // else the item is spliced out of the array
+        removeFromCart(state, item) {
+            for (let i = 0; i < state.items.length; i++) {
+                if (state.items[i].id === item.id) {
+                    if (state.items[i].count > 1) {
+                        state.items[i].count--;
+                        return;
+                    } else {
+                        state.items.splice(i, 1);
+                    }
+                }
+            }
+        },
+
+        clearCart(state) {
+            state.items = [];
+        }
+    }
+  })
 
 const app = new Vue({
     el: '#app',
 
-    router
+    router,
+
+    store: store
 });

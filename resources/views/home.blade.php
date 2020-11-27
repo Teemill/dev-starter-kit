@@ -13,10 +13,16 @@
 
             h1 {
                 text-align: center;
+                margin-top: 10px;
+                margin-bottom: 10px;
+            }
+
+            h2 {
+
             }
 
             h3 {
-                color: #005BFF
+                color: #8d8d8d
             }
 
             label {
@@ -59,10 +65,7 @@
                 display: inline-block;
                 font-size: 16px;
                 border-radius: 4px;
-                margin-left: 5px;
-                margin-right: 5px;
-                margin-top: 5px;
-                margin-bottom: 5px;
+                margin: 20px;
             }
 
             .button:hover {
@@ -77,7 +80,7 @@
 
             .form-grid-container {
                 display: grid;
-                grid-row-gap: 3px;
+                grid-row-gap: 1px;
             }
 
             .form-grid-middle {
@@ -94,12 +97,17 @@
 
             .row {
                 white-space: nowrap;
+                text-align: right;
             }
 
             .row > div {
                 width: auto;
                 height: auto;
                 display: inline-block;
+            }
+
+            .search-bar {
+                width: auto;
             }
 
         </style>

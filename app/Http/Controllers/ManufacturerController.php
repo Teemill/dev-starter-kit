@@ -36,7 +36,7 @@ class ManufacturerController extends Controller
             $data[] = [
                 "id" => $id, 
                 "name" => $name, 
-                "no_of_cars" => $numberOfCars
+                "count" => $numberOfCars
             ];
         }
 

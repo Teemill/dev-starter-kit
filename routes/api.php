@@ -32,7 +32,6 @@ Route::get('animals/get/{animal_id}', "AnimalController@retrieve");
 
 // car api routes
 Route::get('cars/list', "CarController@index");
-Route::get("cars/count/{property}", "CarController@countOn");
 Route::get('cars/get/{id}', "CarController@retrieve");
 Route::post("cars/add", "CarController@store")->middleware("check_password");
 
@@ -41,4 +40,10 @@ Route::get("manufacturers/data", "ManufacturerController@data");
 Route::get('fuel_types/list', "FuelTypeController@index");
 Route::get("fuel_types/data", "FuelTypeController@data");
 
-Route::post("order", "OrderController@place");
+Route::get("searches/data/most_popular", "SearchController@mostPopular");
+
+Route::post("orders", "OrderController@place");
+Route::get("orders/data/total", "OrderController@totalcarOrders");
+Route::get("orders/data/over_time", "OrderController@ordersOverTime");
+Route::get("orders/{order_id}", "OrderController@retrieve");
+

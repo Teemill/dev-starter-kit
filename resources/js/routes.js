@@ -38,8 +38,9 @@ let routes = [
         component: require("./components/Checkout.vue").default
     },
     {
-        path: "/receipt",
-        component: require("./components/Receipt.vue").default
+        path: "/orders/:order_id",
+        component: require("./components/Receipt.vue").default,
+        props: true
     }
 ]
 

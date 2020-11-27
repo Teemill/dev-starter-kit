@@ -6,6 +6,7 @@ use Illuminate\Http\Request;
 use App\Car;
 use App\Manufacturer;
 use App\FuelType;
+use App\Search;
 use App\Http\Resources\CarResource;
 use Illuminate\Support\Facades\Log;
 
@@ -18,6 +19,11 @@ class CarController extends Controller
     public function index() 
     {
         $cars = Car::all();
+
+        if (request("search"))
+        {
+            return $this->search();
+        }
 
         if (request("manufacturer") && request("fueltype"))
         {
@@ -73,12 +79,46 @@ class CarController extends Controller
         $newCar->save();
     }
 
+    private function search() 
+    {
+        $search_query = request("search");
 
-    //should return a response representing the counts for each of the properties of a given type
-    //e.g. all manufacturers 
-    public function countOn($property) {
-        $manufacturers = Manufacturer::all();
+        $search_made_before = Search::where("search_query", $search_query)->first();
 
-        $cars = Car::all();
+        if ($search_made_before)
+        {
+            $search_made_before->count++;
+            $search_made_before->save();
+        }
+        else
+        {
+            $new_search = Search::create([
+                "search_query" => $search_query,
+                "count" => 1
+            ]);
+            $new_search->save();
+        }
+
+        $search_words = explode(" ", $search_query);
+
+        $total_results = collect();
+
+        foreach ($search_words as $word)
+        {
+            $possible_manufacturer = Manufacturer::where("name", $word)->first();
+
+            if ($possible_manufacturer)
+            {
+                $intermediate_results = Car::where("manufacturer_id", $possible_manufacturer->id)->get();
+                $total_results = $total_results->merge($intermediate_results);
+                
+                continue;
+            }
+
+            $possible_cars_by_name = Car::where("name", $word)->get();
+            $total_results = $total_results->merge($possible_cars_by_name);
+        }
+
+        return $total_results->unique();
     }
 }

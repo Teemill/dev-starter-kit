@@ -1,7 +1,10 @@
 <template>
     <div>
-        <button class="button" @click="setToFuelTypeData">Fuel Type</button>
+        <button class="button" @click="setToFuelTypeData">Fuel type</button>
         <button class="button" @click="setToManufacturerData">Manufacturer</button>
+        <button class="button" @click="setToTotalOrdersData">Total orders</button>
+        <button class="button" @click="setToOrdersOverTime">Orders over time</button>
+        <button class="button" @click="setToSearchPopularity">Most popular searches</button>
         <canvas id="myChart" width="400" height="400"></canvas>
     </div>
 </template>
@@ -17,6 +20,8 @@
                 chart: null,
                 chartStarted: false,
                 property: "fuel_types",
+                data_style: "",
+                chart_type: "bar",
                 labels: [],
                 datasets: [{
                     label: "Number of Cars",
@@ -31,13 +36,46 @@
 
         methods: {
             setToFuelTypeData: function() {
+                this.chart_type = "bar";
+                this.datasets.label = "Number of Cars";
                 this.property = "fuel_types";
+                this.data_style = "";
                 this.resetData();
                 this.fetchData();
             },
 
             setToManufacturerData: function() {
+                this.chart_type = "bar";
+                this.datasets.label = "Number of Cars";
                 this.property = "manufacturers";
+                this.data_style = "";
+                this.resetData();
+                this.fetchData();
+            },
+
+            setToTotalOrdersData: function() {
+                this.chart_type = "bar";
+                this.datasets.label = "Number of Orders";
+                this.property = "orders";
+                this.data_style = "total";
+                this.resetData();
+                this.fetchData();
+            },
+
+            setToOrdersOverTime: function() {
+                this.chart_type = "line";
+                this.datasets.label = "Number of Orders";
+                this.property = "orders";
+                this.data_style = "over_time";
+                this.resetData();
+                this.fetchData();
+            },
+
+            setToSearchPopularity: function() {
+                this.chart_type = "bar";
+                this.datasets.label = "Number of Searches";
+                this.property = "searches";
+                this.data_style = "most_popular";
                 this.resetData();
                 this.fetchData();
             },
@@ -49,13 +87,13 @@
 
             fetchData: function() {
                 axios
-                    .get("/api/" + this.property + "/data")
+                    .get("/api/" + this.property + "/data/" + this.data_style)
                     .then((response) => {
                         console.log(response.data);
                         for (let i = 0; i < response.data.length; i++) {
                             console.log(response.data[i])
                             this.labels.push(response.data[i].name);
-                            this.datasets[0].data.push(response.data[i].no_of_cars);
+                            this.datasets[0].data.push(response.data[i].count);
                         }
                         this.startCharts();
                     })
@@ -70,7 +108,7 @@
                 }
                 var ctx = document.getElementById('myChart');
                 this.chart = new Chart(ctx, {
-                    type: 'bar',
+                    type: this.chart_type,
                     data: {
                         labels: this.labels,
                         datasets: [{
