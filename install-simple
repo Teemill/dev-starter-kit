@@ -1,0 +1,1725 @@
+#!/usr/bin/env bash
+#
+# Teemill dev bootstrap (Ubuntu + apt). Interactive arrow/Space menus pick toolchain
+# packages and repositories, then installs, configures GitHub/gcloud/docker, and clones.
+#
+#   bash install-simple
+#   TEEMILL_ROOT=~/src/teemill bash install-simple
+#
+set -u
+
+readonly DEFAULT_TEEMILL_ROOT="${TEEMILL_ROOT:-$HOME/teemill}"
+TEEMILL_ROOT=""
+# Space-separated tool ids after the toolchain menu (e.g. "curl git gh gcloud docker").
+SELECTED_TOOLS_LINE=""
+
+readonly TOOL_IDS_ORDER="curl git gh gcloud docker kubectl helm terraform"
+
+# Shared helpers
+# ---------------------------------------------------------------------------
+
+pkg_as_root() {
+  if [[ "$(id -u)" -eq 0 ]]; then
+    "$@"
+  elif command -v sudo >/dev/null 2>&1; then
+    sudo "$@"
+  else
+    echo "need root or sudo for: $*" >&2
+    return 1
+  fi
+}
+
+http_get_body() {
+  local url="${1:?}"
+  local connect_seconds="${2:-6}"
+  local max_seconds="${3:-25}"
+
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL --connect-timeout "$connect_seconds" --max-time "$max_seconds" "$url" 2>/dev/null || true
+    return 0
+  fi
+
+  if command -v wget >/dev/null 2>&1; then
+    wget -qO- --timeout="$max_seconds" "$url" 2>/dev/null || true
+  fi
+}
+
+http_get_github_json() {
+  local url="${1:?}"
+
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL --connect-timeout 6 --max-time 22 \
+      -H 'Accept: application/vnd.github+json' \
+      -H 'User-Agent: TeemillDevStarterKit/1' \
+      "$url" 2>/dev/null || true
+    return 0
+  fi
+
+  if command -v wget >/dev/null 2>&1; then
+    wget -qO- --timeout=25 "$url" 2>/dev/null || true
+  fi
+}
+
+github_latest_tag() {
+  local url="${1:?}"
+  local body
+
+  body="$(http_get_github_json "$url")"
+  echo "$body" | grep -m1 -oE '"tag_name"[[:space:]]*:[[:space:]]*"[^"]+"' | sed -E 's/.*"([^"]+)".*/\1/' | sed -E 's/^v//'
+}
+
+banner() {
+  echo "" >&2
+  echo "--- $* ---" >&2
+}
+
+apt_cache_has() {
+  apt-cache show "$1" >/dev/null 2>&1
+}
+
+# ---------------------------------------------------------------------------
+# Menu support: toolchain / repo installed + target columns
+# ---------------------------------------------------------------------------
+
+toggle_version_or_dash() {
+  local value="${1:-}"
+  value="${value//$'\n'/ }"
+  value="${value//[[:space:]]/}"
+  if [[ -z "$value" ]]; then
+    printf '-'
+    return
+  fi
+  if [[ "${#value}" -gt 14 ]]; then
+    printf '%s' "${value:0:14}"
+    return
+  fi
+  printf '%s' "$value"
+}
+
+toolchain_manifest_line_installed() {
+  local _root="$1"
+  local manifest_line="$2"
+  local tool_id v fn
+  tool_id="$(manifest_field "$manifest_line" 1)"
+  fn="version_${tool_id}"
+  declare -f "$fn" >/dev/null 2>&1 || return 1
+  v="$("$fn")"
+  [[ -n "${v// }" ]]
+}
+
+toggle_toolchain_installed_version() {
+  local _root="$1"
+  local manifest_line="$2"
+  local tool_id raw fn
+  tool_id="$(manifest_field "$manifest_line" 1)"
+  fn="version_${tool_id}"
+  raw=""
+  declare -f "$fn" >/dev/null 2>&1 && raw="$("$fn")"
+  toggle_version_or_dash "$raw"
+}
+
+toggle_toolchain_target_version() {
+  local _root="$1"
+  local manifest_line="$2"
+  local tool_id raw fn
+  tool_id="$(manifest_field "$manifest_line" 1)"
+  fn="upstream_${tool_id}"
+  raw=""
+  declare -f "$fn" >/dev/null 2>&1 && raw="$("$fn")"
+  toggle_version_or_dash "$raw"
+}
+
+version_repo_for_menu() {
+  local teemill_root="${1:?}"
+  local manifest_line="${2:?}"
+  local dest
+  dest="$(manifest_clone_target_path "$teemill_root" "$manifest_line")"
+  if [[ ! -d "$dest/.git" ]]; then
+    echo ""
+    return
+  fi
+  git -C "$dest" rev-parse --short HEAD 2>/dev/null || echo ""
+}
+
+upstream_repo_for_menu() {
+  local _root="${1:?}"
+  local manifest_line="${2:?}"
+  local url head
+  url="$(manifest_field "$manifest_line" 3)"
+  if [[ -z "$url" ]]; then
+    echo ""
+    return
+  fi
+  head="$(GIT_SSH_COMMAND="ssh -o BatchMode=yes -o ConnectTimeout=5" timeout 10 git ls-remote "$url" HEAD 2>/dev/null | awk '{print substr($1,1,9)}')"
+  echo "$head"
+}
+
+toggle_repo_installed_version() {
+  local teemill_root="$1"
+  local manifest_line="$2"
+  local raw
+  raw="$(version_repo_for_menu "$teemill_root" "$manifest_line")"
+  raw="${raw//$'\n'/ }"
+  raw="${raw//[[:space:]]/}"
+  toggle_version_or_dash "$raw"
+}
+
+toggle_repo_target_version() {
+  local teemill_root="$1"
+  local manifest_line="$2"
+  local raw
+  raw="$(upstream_repo_for_menu "$teemill_root" "$manifest_line")"
+  raw="${raw//$'\n'/ }"
+  raw="${raw//[[:space:]]/}"
+  toggle_version_or_dash "$raw"
+}
+
+
+# Repositories offered. Format:
+#   id|description|clone_url|target_directory
+# If target_directory is empty, it defaults to id.
+readonly REPO_MANIFEST='
+core-api|Core API (backend)|git@github.com:Teemill/core-api.git|
+frontend|Frontend|git@github.com:Teemill/frontend.git|
+frontend-legacy|Frontend (legacy tree; same remote as frontend)|git@github.com:Teemill/frontend.git|frontend-legacy
+image-api|Image API|git@github.com:Teemill/image-api.git|
+enforcer|Enforcer|git@github.com:Teemill/enforcer.git|
+drive|Drive|git@github.com:Teemill/drive.git|
+file-processor|File processor|git@github.com:Teemill/file-processor.git|
+domain-manager|Domains (domain-manager)|git@github.com:Teemill/domain-manager.git|
+metrics|Metrics|git@github.com:Teemill/metrics.git|
+product-feed|Product feed|git@github.com:Teemill/product-feed.git|
+infrastructure|Infrastructure|git@github.com:Teemill/infrastructure.git|
+'
+
+# Space-separated repo ids chosen when you press Enter at the prompt.
+readonly DEFAULT_SELECTED_IDS="core-api frontend image-api"
+
+# Toolchain packages (id|description). Defaults: curl git gh gcloud docker; optional off by default: kubectl helm terraform.
+readonly TOOL_MANIFEST='
+curl|curl (HTTP client)|
+git|git (version control)|
+gh|GitHub CLI (gh)|
+gcloud|Google Cloud SDK (gcloud)|
+docker|Docker (distro engine; user in docker group = no sudo for docker(1))|
+kubectl|kubectl (Kubernetes CLI)|
+helm|Helm (Kubernetes package manager)|
+terraform|Terraform (IaC)|
+'
+
+readonly DEFAULT_SELECTED_TOOL_IDS="curl git gh gcloud docker"
+
+arrow_menu_tty_available() {
+  exec 3<>/dev/tty 2>/dev/null && [[ -t 3 ]] && exec 3<&- && exec 3>&-
+}
+
+is_id_in_default_list() {
+  local default_space_list="$1"
+  local candidate="$2"
+  local token
+
+  for token in $default_space_list; do
+    if [[ "$token" == "$candidate" ]]; then
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+is_selected_by_default() {
+  is_id_in_default_list "$DEFAULT_SELECTED_IDS" "$1"
+}
+
+# Reads one logical key from fd 3. Prints a token: UP DOWN ENTER SPACE ESC Q NONE
+# Uses read -N1 (not -n1): Enter sends LF/CR and must be read as data, not as read's line delimiter.
+read_menu_key() {
+  local tty_fd="$1"
+  local first second third
+
+  IFS= read -rsN1 -u "$tty_fd" first || return 1
+
+  if [[ -z "$first" ]]; then
+    printf 'ENTER'
+    return
+  fi
+
+  if [[ "$first" == $'\e' ]]; then
+    if ! IFS= read -rsN1 -t 0.05 -u "$tty_fd" second; then
+      printf 'ESC'
+      return
+    fi
+
+    if [[ "$second" == "[" || "$second" == "O" ]]; then
+      if ! IFS= read -rsN1 -t 0.05 -u "$tty_fd" third; then
+        printf 'NONE'
+        return
+      fi
+
+      if [[ "$second" == "[" ]]; then
+        case "$third" in
+          A) printf 'UP' ;;
+          B) printf 'DOWN' ;;
+          *) printf 'NONE' ;;
+        esac
+
+        return
+      fi
+
+      if [[ "$second" == "O" ]]; then
+        case "$third" in
+          A) printf 'UP' ;;
+          B) printf 'DOWN' ;;
+          *) printf 'NONE' ;;
+        esac
+
+        return
+      fi
+    fi
+
+    printf 'NONE'
+    return
+  fi
+
+  if [[ "$first" == " " ]]; then
+    printf 'SPACE'
+    return
+  fi
+
+  if [[ "$first" == $'\n' || "$first" == $'\r' ]]; then
+    printf 'ENTER'
+    return
+  fi
+
+  if [[ "$first" == "q" || "$first" == "Q" ]]; then
+    printf 'Q'
+    return
+  fi
+
+  printf 'NONE'
+}
+
+# Same TTY UX as repos; shows on-PATH tools with [✓] and installed vs upstream columns.
+run_tool_arrow_menu() {
+  local menu_status=0
+
+  TEEMILL_TOGGLE_VERSION_INSTALLED_FN=toggle_toolchain_installed_version
+  TEEMILL_TOGGLE_VERSION_TARGET_FN=toggle_toolchain_target_version
+
+  run_toggle_arrow_menu \
+    "Toolchain packages  (install / upgrade)" \
+    $'  [✓] = already on PATH  |  columns: installed -> target (upstream / distro; best effort)\n  ↑/↓ move (rows not yet on PATH)   Space toggle   Enter confirm   q quit' \
+    "" \
+    toolchain_manifest_line_installed \
+    "$DEFAULT_SELECTED_TOOL_IDS" \
+    "$@" || menu_status=$?
+
+  unset TEEMILL_TOGGLE_VERSION_INSTALLED_FN TEEMILL_TOGGLE_VERSION_TARGET_FN
+
+  return "$menu_status"
+}
+
+# Draws on fd 3; prints selected manifest ids (field 1) to stdout (one per line) on Enter.
+run_toggle_arrow_menu() {
+  local menu_title_line="$1"
+  local menu_hint_line="$2"
+  local root_for_installed="$3"
+  local installed_check_fn="$4"
+  local default_ids_string="$5"
+  shift 5
+  local -a manifest_lines=("$@")
+  local count="${#manifest_lines[@]}"
+  local tty_fd=3
+  local saved_stty=""
+  local -a selected=()
+  local -a installed=()
+  local -a version_installed_col=()
+  local -a version_target_col=()
+  local -a selectable_pos=()
+  local sel_n=0
+  local sel_ix=0
+  local cursor=-1
+  local index
+
+  if [[ -n "$root_for_installed" ]] && [[ -d "$root_for_installed" ]]; then
+    root_for_installed="$(cd -- "$root_for_installed" && pwd)"
+  fi
+
+  exec 3<>/dev/tty || return 2
+
+  if ! [[ -t 3 ]]; then
+    exec 3<&-
+    exec 3>&-
+
+    return 2
+  fi
+
+  saved_stty="$(stty -g <&3)"
+  local menu_cleaned=0
+
+  cleanup_arrow_menu() {
+    if [[ "$menu_cleaned" -eq 1 ]]; then
+      return 0
+    fi
+
+    menu_cleaned=1
+    printf '\e[?25h' >&3 2>/dev/null || true
+
+    if [[ -n "${saved_stty:-}" ]]; then
+      stty "$saved_stty" <&3 2>/dev/null || true
+    fi
+
+    exec 3<&-
+    exec 3>&-
+  }
+
+  trap 'trap - EXIT; cleanup_arrow_menu; trap - INT; exit 130' INT
+  trap 'cleanup_arrow_menu' EXIT
+
+  stty -echo -icanon min 1 time 0 <&3
+
+  local manifest_line display_id
+
+  for ((index = 0; index < count; index++)); do
+    manifest_line="${manifest_lines[index]}"
+    display_id="$(manifest_field "$manifest_line" 1)"
+
+    if "$installed_check_fn" "$root_for_installed" "$manifest_line"; then
+      installed[index]=1
+      selected[index]=0
+    else
+      installed[index]=0
+      selectable_pos+=("$index")
+
+      if is_id_in_default_list "$default_ids_string" "$display_id"; then
+        selected[index]=1
+      else
+        selected[index]=0
+      fi
+    fi
+  done
+
+  if [[ -n "${TEEMILL_TOGGLE_VERSION_INSTALLED_FN:-}" || -n "${TEEMILL_TOGGLE_VERSION_TARGET_FN:-}" ]]; then
+    local vi vt
+
+    for ((index = 0; index < count; index++)); do
+      manifest_line="${manifest_lines[index]}"
+      vi="-"
+      vt="-"
+
+      if [[ -n "${TEEMILL_TOGGLE_VERSION_INSTALLED_FN:-}" ]]; then
+        vi="$("$TEEMILL_TOGGLE_VERSION_INSTALLED_FN" "$root_for_installed" "$manifest_line")"
+        [[ -z "${vi// }" ]] && vi="-"
+      fi
+
+      if [[ -n "${TEEMILL_TOGGLE_VERSION_TARGET_FN:-}" ]]; then
+        vt="$("$TEEMILL_TOGGLE_VERSION_TARGET_FN" "$root_for_installed" "$manifest_line")"
+        [[ -z "${vt// }" ]] && vt="-"
+      fi
+
+      version_installed_col[index]="${vi:0:14}"
+      version_target_col[index]="${vt:0:14}"
+    done
+  fi
+
+  sel_n="${#selectable_pos[@]}"
+
+  if [[ "$sel_n" -gt 0 ]]; then
+    sel_ix=0
+    cursor="${selectable_pos[0]}"
+  fi
+
+  # Screen lines before the first repo row (title, blank, hint, blank).
+  local -r menu_screen_header_lines=3
+
+  draw_menu_row() {
+    local row_index="$1"
+    local with_cursor_highlight="$2"
+    local screen_line=$((menu_screen_header_lines + 1 + row_index))
+    local manifest_line display_id description row_mark
+    local vi="-"
+    local vt="-"
+
+    manifest_line="${manifest_lines[row_index]}"
+    display_id="$(manifest_field "$manifest_line" 1)"
+    description="$(manifest_field "$manifest_line" 2)"
+
+    if [[ -n "${TEEMILL_TOGGLE_VERSION_INSTALLED_FN:-}" || -n "${TEEMILL_TOGGLE_VERSION_TARGET_FN:-}" ]]; then
+      vi="${version_installed_col[row_index]:--}"
+      vt="${version_target_col[row_index]:--}"
+    fi
+
+    printf '\e[%d;1H\e[K' "$screen_line" >&3
+
+    if [[ -n "${TEEMILL_TOGGLE_VERSION_INSTALLED_FN:-}" || -n "${TEEMILL_TOGGLE_VERSION_TARGET_FN:-}" ]]; then
+      if [[ "${installed[row_index]:-0}" -eq 1 ]]; then
+        printf '  \e[32m%s  %-14s  %-14s  %-14s  %s\e[0m' '[✓]' "$display_id" "$vi" "$vt" "$description" >&3
+
+        return
+      fi
+
+      row_mark="[ ]"
+
+      if [[ "${selected[row_index]:-0}" -eq 1 ]]; then
+        row_mark="[x]"
+      fi
+
+      if [[ "$with_cursor_highlight" -eq 1 ]]; then
+        printf '  \e[7m%s  %-14s  %-14s  %-14s  %s\e[0m' "$row_mark" "$display_id" "$vi" "$vt" "$description" >&3
+      else
+        printf '  %s  %-14s  %-14s  %-14s  %s' "$row_mark" "$display_id" "$vi" "$vt" "$description" >&3
+      fi
+
+      return
+    fi
+
+    if [[ "${installed[row_index]:-0}" -eq 1 ]]; then
+      printf '  \e[32m%s  %-18s  %s\e[0m' '[✓]' "$display_id" "$description" >&3
+
+      return
+    fi
+
+    row_mark="[ ]"
+
+    if [[ "${selected[row_index]:-0}" -eq 1 ]]; then
+      row_mark="[x]"
+    fi
+
+    if [[ "$with_cursor_highlight" -eq 1 ]]; then
+      printf '  \e[7m%s  %-18s  %s\e[0m' "$row_mark" "$display_id" "$description" >&3
+    else
+      printf '  %s  %-18s  %s' "$row_mark" "$display_id" "$description" >&3
+    fi
+  }
+
+  local first_menu_draw=1
+  local old_cursor=0
+  local redraw_key
+
+  while true; do
+    if [[ "$first_menu_draw" -eq 1 ]]; then
+      printf '\e[2J\e[H\e[?25l' >&3
+      printf '%s\n' "$menu_title_line" >&3
+      echo >&3
+      printf '%s\n' "$menu_hint_line" >&3
+
+      for ((index = 0; index < count; index++)); do
+        if [[ "$sel_n" -gt 0 && "$index" -eq "$cursor" ]]; then
+          draw_menu_row "$index" 1
+        else
+          draw_menu_row "$index" 0
+        fi
+      done
+
+      first_menu_draw=0
+    fi
+
+    redraw_key="$(read_menu_key "$tty_fd")"
+    old_cursor="$cursor"
+
+    case "$redraw_key" in
+      UP)
+        if [[ "$sel_n" -eq 0 ]]; then
+          :
+        else
+          sel_ix=$(( (sel_ix - 1 + sel_n) % sel_n ))
+          cursor="${selectable_pos[$sel_ix]}"
+          draw_menu_row "$old_cursor" 0
+          draw_menu_row "$cursor" 1
+        fi
+        ;;
+      DOWN)
+        if [[ "$sel_n" -eq 0 ]]; then
+          :
+        else
+          sel_ix=$(( (sel_ix + 1) % sel_n ))
+          cursor="${selectable_pos[$sel_ix]}"
+          draw_menu_row "$old_cursor" 0
+          draw_menu_row "$cursor" 1
+        fi
+        ;;
+      SPACE)
+        if [[ "$sel_n" -eq 0 ]]; then
+          :
+        elif [[ "${installed[cursor]:-0}" -eq 1 ]]; then
+          :
+        else
+          if [[ "${selected[cursor]:-0}" -eq 1 ]]; then
+            selected[cursor]=0
+          else
+            selected[cursor]=1
+          fi
+
+          draw_menu_row "$cursor" 1
+        fi
+        ;;
+      ENTER)
+        trap - EXIT
+        trap - INT
+        cleanup_arrow_menu
+
+        for ((index = 0; index < count; index++)); do
+          if [[ "${installed[index]:-0}" -eq 1 ]]; then
+            continue
+          fi
+
+          if [[ "${selected[index]:-0}" -eq 1 ]]; then
+            manifest_line="${manifest_lines[index]}"
+            manifest_field "$manifest_line" 1
+          fi
+        done
+
+        return 0
+        ;;
+      ESC | Q)
+        trap - EXIT
+        trap - INT
+        cleanup_arrow_menu
+
+        return 0
+        ;;
+      *)
+        ;;
+    esac
+  done
+}
+
+run_repo_arrow_menu() {
+  local teemill_root="$1"
+  local menu_status=0
+  shift
+  local -a manifest_lines=("$@")
+
+  if [[ -d "$teemill_root" ]]; then
+    teemill_root="$(cd -- "$teemill_root" && pwd)"
+  fi
+
+  TEEMILL_TOGGLE_VERSION_INSTALLED_FN=toggle_repo_installed_version
+  TEEMILL_TOGGLE_VERSION_TARGET_FN=toggle_repo_target_version
+
+  run_toggle_arrow_menu \
+    "Teemill repositories  (clone into: $teemill_root)" \
+    $'  [✓] = already cloned  |  columns: local HEAD -> remote HEAD (best effort; needs SSH to GitHub)\n  ↑/↓ move (repos to clone only)   Space toggle   Enter confirm   q quit' \
+    "$teemill_root" \
+    is_manifest_repo_installed \
+    "$DEFAULT_SELECTED_IDS" \
+    "${manifest_lines[@]}" || menu_status=$?
+
+  unset TEEMILL_TOGGLE_VERSION_INSTALLED_FN TEEMILL_TOGGLE_VERSION_TARGET_FN
+
+  return "$menu_status"
+}
+
+# HEREDOC-style manifest blocks: drop blank lines and #-comments.
+manifest_non_comment_lines_from() {
+  local raw="${1:?}"
+
+  grep -v '^[[:space:]]*$' <<<"$raw" | grep -v '^[[:space:]]*#'
+}
+
+parse_manifest_lines() {
+  manifest_non_comment_lines_from "$REPO_MANIFEST"
+}
+
+parse_tool_manifest_lines() {
+  manifest_non_comment_lines_from "$TOOL_MANIFEST"
+}
+
+manifest_field() {
+  local line="$1"
+  local index="$2"
+  echo "$line" | awk -F'|' -v "idx=$index" '{gsub(/^[ \t]+|[ \t]+$/,"",$idx); print $idx}'
+}
+
+# Clone destination directory for a manifest row (absolute teemill_root recommended).
+manifest_clone_target_path() {
+  local teemill_root="$1"
+  local manifest_line="$2"
+  local id target_dir
+
+  id="$(manifest_field "$manifest_line" 1)"
+  target_dir="$(manifest_field "$manifest_line" 4)"
+  [[ -z "$target_dir" ]] && target_dir="$id"
+  printf '%s/%s' "$teemill_root" "$target_dir"
+}
+
+is_manifest_repo_installed() {
+  local dest_path
+  dest_path="$(manifest_clone_target_path "$1" "$2")"
+  [[ -d "$dest_path/.git" ]]
+}
+
+# Prints one repo id per line to stdout. Uses arrow/Space on /dev/tty when available.
+prompt_repo_ids_cli() {
+  local teemill_root="$1"
+  local -a manifest_lines=()
+  local manifest_line
+
+  while IFS= read -r manifest_line; do
+    [[ -z "$manifest_line" ]] && continue
+    manifest_lines+=("$manifest_line")
+  done < <(parse_manifest_lines)
+
+  if [[ "${#manifest_lines[@]}" -eq 0 ]]; then
+    echo "internal error: empty manifest." >&2
+    exit 2
+  fi
+
+  if [[ -d "$teemill_root" ]]; then
+    teemill_root="$(cd -- "$teemill_root" && pwd)"
+  fi
+
+  if arrow_menu_tty_available; then
+    local menu_status=0
+    run_repo_arrow_menu "$teemill_root" "${manifest_lines[@]}" || menu_status=$?
+
+    if [[ "$menu_status" -eq 2 ]]; then
+      prompt_repo_ids_fallback_numbers "$teemill_root" "${manifest_lines[@]}"
+    fi
+
+    return
+  fi
+
+  prompt_repo_ids_fallback_numbers "$teemill_root" "${manifest_lines[@]}"
+}
+
+# Plain line-based multi-select when there is no usable TTY for the arrow menu.
+# installed_check_fn is invoked as: fn root_for_installed manifest_line
+prompt_toggle_ids_fallback_numbers() {
+  local root_for_installed="$1"
+  local title_line="$2"
+  local installed_check_fn="$3"
+  local default_ids_string="$4"
+  local footer_default_hint="$5"
+  local footer_installed_hint="$6"
+  local prompt_label="$7"
+  shift 7
+  local -a manifest_lines=("$@")
+  local count="${#manifest_lines[@]}"
+  local index display_id description marker
+  local reply normalized token start end i j
+  local manifest_line
+  local -a row_installed=()
+  local vi vt
+
+  if [[ -n "$root_for_installed" ]] && [[ -d "$root_for_installed" ]]; then
+    root_for_installed="$(cd -- "$root_for_installed" && pwd)"
+  fi
+
+  for ((index = 0; index < count; index++)); do
+    manifest_line="${manifest_lines[index]}"
+
+    if "$installed_check_fn" "$root_for_installed" "$manifest_line"; then
+      row_installed[index]=1
+    else
+      row_installed[index]=0
+    fi
+  done
+
+  banner "Numbered multi-select (no arrow-menu TTY)"
+  echo "" >&2
+  printf '%s\n' "$title_line" >&2
+  echo >&2
+
+  if [[ -n "${TEEMILL_TOGGLE_VERSION_INSTALLED_FN:-}" || -n "${TEEMILL_TOGGLE_VERSION_TARGET_FN:-}" ]]; then
+    echo "  Legend: installed -> target (best effort)." >&2
+    echo >&2
+  fi
+
+  index=1
+
+  for ((j = 0; j < count; j++)); do
+    manifest_line="${manifest_lines[j]}"
+    display_id="$(manifest_field "$manifest_line" 1)"
+    description="$(manifest_field "$manifest_line" 2)"
+    marker=" "
+    vi="-"
+    vt="-"
+
+    if [[ -n "${TEEMILL_TOGGLE_VERSION_INSTALLED_FN:-}" ]]; then
+      vi="$("$TEEMILL_TOGGLE_VERSION_INSTALLED_FN" "$root_for_installed" "$manifest_line")"
+      [[ -z "${vi// }" ]] && vi="-"
+    fi
+
+    if [[ -n "${TEEMILL_TOGGLE_VERSION_TARGET_FN:-}" ]]; then
+      vt="$("$TEEMILL_TOGGLE_VERSION_TARGET_FN" "$root_for_installed" "$manifest_line")"
+      [[ -z "${vt// }" ]] && vt="-"
+    fi
+
+    vi="${vi:0:14}"
+    vt="${vt:0:14}"
+
+    if [[ -n "${TEEMILL_TOGGLE_VERSION_INSTALLED_FN:-}" || -n "${TEEMILL_TOGGLE_VERSION_TARGET_FN:-}" ]]; then
+      if [[ "${row_installed[j]:-0}" -eq 1 ]]; then
+        marker='[✓]'
+        printf '  \e[32m%s  %2d  %-12s  %-14s  %-14s  %s\e[0m\n' "$marker" "$index" "$display_id" "$vi" "$vt" "$description" >&2
+      else
+        if is_id_in_default_list "$default_ids_string" "$display_id"; then
+          marker="*"
+        fi
+
+        printf '  %s  %2d  %-12s  %-14s  %-14s  %s\n' "$marker" "$index" "$display_id" "$vi" "$vt" "$description" >&2
+      fi
+    else
+      if [[ "${row_installed[j]:-0}" -eq 1 ]]; then
+        marker='[✓]'
+        printf '  \e[32m%s  %2d  %-20s  %s\e[0m\n' "$marker" "$index" "$display_id" "$description" >&2
+      else
+        if is_id_in_default_list "$default_ids_string" "$display_id"; then
+          marker="*"
+        fi
+
+        printf '  %s  %2d  %-20s  %s\n' "$marker" "$index" "$display_id" "$description" >&2
+      fi
+    fi
+
+    index=$((index + 1))
+  done
+
+  echo >&2
+  echo "  ${footer_default_hint}" >&2
+
+  if [[ -n "${footer_installed_hint}" ]]; then
+    echo "  ${footer_installed_hint}" >&2
+  fi
+
+  echo "  Enter: 1-based numbers (spaces or commas), ranges like 3-5, \"all\", \"none\", or empty for defaults." >&2
+  printf '  %s' "$prompt_label" >&2
+
+  reply=""
+
+  if [[ -r /dev/tty ]]; then
+    read -r reply </dev/tty || true
+  else
+    read -r reply || true
+  fi
+
+  normalized="${reply//,/ }"
+  normalized="${normalized#"${normalized%%[![:space:]]*}"}"
+  normalized="${normalized%"${normalized##*[![:space:]]}"}"
+
+  if [[ -z "$normalized" ]]; then
+    for ((j = 0; j < count; j++)); do
+      manifest_line="${manifest_lines[j]}"
+      display_id="$(manifest_field "$manifest_line" 1)"
+
+      if [[ "${row_installed[j]:-0}" -eq 1 ]]; then
+        continue
+      fi
+
+      if is_id_in_default_list "$default_ids_string" "$display_id"; then
+        echo "$display_id"
+      fi
+    done
+
+    return
+  fi
+
+  if [[ "${normalized,,}" == "none" ]]; then
+    return
+  fi
+
+  if [[ "${normalized,,}" == "all" ]]; then
+    for ((j = 0; j < count; j++)); do
+      manifest_line="${manifest_lines[j]}"
+
+      if [[ "${row_installed[j]:-0}" -eq 1 ]]; then
+        continue
+      fi
+
+      manifest_field "$manifest_line" 1
+    done
+
+    return
+  fi
+
+  declare -A picked=()
+
+  for token in $normalized; do
+    if [[ "$token" =~ ^([1-9][0-9]*)-([1-9][0-9]*)$ ]]; then
+      start="${BASH_REMATCH[1]}"
+      end="${BASH_REMATCH[2]}"
+
+      if [[ "$start" -gt "$end" ]]; then
+        local swap="$start"
+        start="$end"
+        end="$swap"
+      fi
+
+      if [[ "$end" -gt "$count" ]] || [[ "$start" -lt 1 ]]; then
+        echo "range out of bounds: $token (valid 1-$count)" >&2
+        exit 2
+      fi
+
+      for ((j = start; j <= end; j++)); do
+        picked[$j]=1
+      done
+
+      continue
+    fi
+
+    if [[ "$token" =~ ^[1-9][0-9]*$ ]]; then
+      if [[ "$token" -lt 1 ]] || [[ "$token" -gt "$count" ]]; then
+        echo "index out of bounds: $token (valid 1-$count)" >&2
+        exit 2
+      fi
+
+      picked[$token]=1
+      continue
+    fi
+
+    echo "could not parse token: $token (use numbers, ranges, all, or none)" >&2
+    exit 2
+  done
+
+  for ((i = 1; i <= count; i++)); do
+    if [[ -n "${picked[$i]:-}" ]]; then
+      if [[ "${row_installed[i - 1]:-0}" -eq 1 ]]; then
+        continue
+      fi
+
+      manifest_line="${manifest_lines[i - 1]}"
+      manifest_field "$manifest_line" 1
+    fi
+  done
+}
+
+prompt_repo_ids_fallback_numbers() {
+  local teemill_root="$1"
+  shift
+
+  TEEMILL_TOGGLE_VERSION_INSTALLED_FN=toggle_repo_installed_version
+  TEEMILL_TOGGLE_VERSION_TARGET_FN=toggle_repo_target_version
+
+  prompt_toggle_ids_fallback_numbers \
+    "$teemill_root" \
+    "Teemill repos (clone into: $teemill_root)  (no TTY: type numbers instead of arrow keys)" \
+    is_manifest_repo_installed \
+    "$DEFAULT_SELECTED_IDS" \
+    "* = default clone set (only repos not already installed)." \
+    "[✓] = already cloned under this path (skipped for defaults, \"all\", and numbers)." \
+    "Which to clone? [default bundle] " \
+    "$@"
+
+  unset TEEMILL_TOGGLE_VERSION_INSTALLED_FN TEEMILL_TOGGLE_VERSION_TARGET_FN
+}
+
+prompt_tool_ids_fallback_numbers() {
+  TEEMILL_TOGGLE_VERSION_INSTALLED_FN=toggle_toolchain_installed_version
+  TEEMILL_TOGGLE_VERSION_TARGET_FN=toggle_toolchain_target_version
+
+  prompt_toggle_ids_fallback_numbers \
+    "" \
+    "Toolchain packages  (no TTY: type numbers instead of arrow keys)" \
+    toolchain_manifest_line_installed \
+    "$DEFAULT_SELECTED_TOOL_IDS" \
+    "* = default toolchain bundle." \
+    "" \
+    "Which tools to install? [default bundle] " \
+    "$@"
+
+  unset TEEMILL_TOGGLE_VERSION_INSTALLED_FN TEEMILL_TOGGLE_VERSION_TARGET_FN
+}
+
+prompt_tool_ids_cli() {
+  local -a manifest_lines=()
+  local manifest_line
+
+  while IFS= read -r manifest_line; do
+    [[ -z "$manifest_line" ]] && continue
+    manifest_lines+=("$manifest_line")
+  done < <(parse_tool_manifest_lines)
+
+  if [[ "${#manifest_lines[@]}" -eq 0 ]]; then
+    echo "internal error: empty tool manifest." >&2
+    exit 2
+  fi
+
+  if arrow_menu_tty_available; then
+    local menu_status=0
+
+    run_tool_arrow_menu "${manifest_lines[@]}" || menu_status=$?
+
+    if [[ "$menu_status" -eq 2 ]]; then
+      prompt_tool_ids_fallback_numbers "${manifest_lines[@]}"
+    fi
+
+    return
+  fi
+
+  prompt_tool_ids_fallback_numbers "${manifest_lines[@]}"
+}
+
+# Tools: install / version / upstream / setup
+# ---------------------------------------------------------------------------
+
+install_curl() {
+  command -v curl >/dev/null 2>&1 && return 0
+  pkg_as_root apt-get install -y -qq curl
+}
+
+version_curl() {
+  command -v curl >/dev/null 2>&1 || {
+    echo ""
+    return
+  }
+  curl --version 2>/dev/null | head -n1 | sed -E 's/^curl ([0-9][0-9.]*).*/\1/'
+}
+
+upstream_curl() {
+  github_latest_tag "https://api.github.com/repos/curl/curl/releases/latest"
+}
+
+setup_curl() {
+  :
+}
+
+install_git() {
+  command -v git >/dev/null 2>&1 && return 0
+  pkg_as_root apt-get install -y -qq git
+}
+
+version_git() {
+  command -v git >/dev/null 2>&1 || {
+    echo ""
+    return
+  }
+  git --version 2>/dev/null | sed -E 's/.*git version ([0-9][0-9.]*).*/\1/'
+}
+
+upstream_git() {
+  github_latest_tag "https://api.github.com/repos/git/git/releases/latest"
+}
+
+setup_git() {
+  local ssh_dir="$HOME/.ssh"
+  local ssh_config="$ssh_dir/config"
+  local chosen_private_key=""
+  local reply=""
+
+  banner "Git: SSH keys and GitHub host config"
+
+  mkdir -p "$ssh_dir" || return 0
+  chmod 700 "$ssh_dir" || return 0
+
+  if [[ -f "$ssh_dir/id_ed25519" ]]; then
+    chosen_private_key="$ssh_dir/id_ed25519"
+  elif [[ -f "$ssh_dir/id_rsa" ]]; then
+    chosen_private_key="$ssh_dir/id_rsa"
+  fi
+
+  if [[ -z "$chosen_private_key" ]]; then
+    if [[ -t 1 ]] && [[ -r /dev/tty ]] && [[ -w /dev/tty ]]; then
+      printf 'generate SSH key at %s/id_ed25519? [Y/n] ' "$ssh_dir" >&2
+      read -r reply </dev/tty || reply="n"
+
+      case "${reply,,}" in
+        "" | y | yes)
+          echo "running ssh-keygen (optional passphrase on the TTY)." >&2
+          if ssh-keygen -t ed25519 -f "$ssh_dir/id_ed25519" \
+            -C "teemill-dev-starter-$(whoami)@$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo host)" \
+            </dev/tty; then
+            chosen_private_key="$ssh_dir/id_ed25519"
+          fi
+          ;;
+      esac
+    else
+      echo "no SSH key found; create one with: ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519" >&2
+    fi
+  fi
+
+  if [[ -z "$chosen_private_key" ]]; then
+    return 0
+  fi
+
+  if ! ssh-add "$chosen_private_key" 2>/dev/null; then
+    echo "ssh-add failed (try: eval \"\$(ssh-agent -s)\" then ssh-add \"$chosen_private_key\")." >&2
+  fi
+
+  if [[ -f "$ssh_config" ]] && grep -qE '^[[:space:]]*Host[[:space:]]+github\.com([[:space:]]|$)' "$ssh_config"; then
+    :
+  elif [[ -f "$ssh_config" ]]; then
+    {
+      echo ""
+      echo "# Added by Teemill dev-starter-kit (GitHub SSH defaults)"
+      echo "Host github.com"
+      echo "  AddKeysToAgent yes"
+      echo "  IdentitiesOnly yes"
+      echo "  IdentityFile $chosen_private_key"
+    } >>"$ssh_config"
+    chmod 600 "$ssh_config" 2>/dev/null || true
+  else
+    {
+      echo "# Added by Teemill dev-starter-kit (GitHub SSH defaults)"
+      echo "Host github.com"
+      echo "  AddKeysToAgent yes"
+      echo "  IdentitiesOnly yes"
+      echo "  IdentityFile $chosen_private_key"
+    } >"$ssh_config"
+    chmod 600 "$ssh_config" 2>/dev/null || true
+  fi
+
+  if [[ -f "${chosen_private_key}.pub" ]]; then
+    echo "add this public key to GitHub: https://github.com/settings/keys" >&2
+    echo "----" >&2
+    cat "${chosen_private_key}.pub" >&2
+    echo "----" >&2
+  fi
+}
+
+install_gh() {
+  command -v gh >/dev/null 2>&1 && return 0
+  pkg_as_root apt-get install -y -qq gh
+}
+
+version_gh() {
+  command -v gh >/dev/null 2>&1 || {
+    echo ""
+    return
+  }
+  gh version 2>/dev/null | head -n1 | sed -E 's/^gh version ([0-9][0-9.]*).*/\1/'
+}
+
+upstream_gh() {
+  github_latest_tag "https://api.github.com/repos/cli/cli/releases/latest"
+}
+
+setup_gh() {
+  local gh_authenticated="false"
+  local git_name_val=""
+  local git_email_val=""
+  local api_login=""
+
+  banner "GitHub CLI: gh auth and git helper"
+
+  if gh config set -h github.com git_protocol ssh 2>/dev/null; then
+    :
+  elif gh config set git_protocol ssh 2>/dev/null; then
+    echo "set gh git_protocol ssh globally." >&2
+  else
+    echo "could not set gh git_protocol ssh." >&2
+  fi
+
+  if gh auth status -h github.com >/dev/null 2>&1; then
+    gh_authenticated="true"
+  elif gh auth status 2>&1 | grep -qi 'Logged in to github.com'; then
+    gh_authenticated="true"
+  fi
+
+  if [[ "$gh_authenticated" != "true" ]]; then
+    if [[ -t 1 ]] && [[ -r /dev/tty ]] && [[ -w /dev/tty ]]; then
+      echo "launching gh auth login (github.com, SSH, web)." >&2
+      gh auth login -h github.com --git-protocol ssh --web </dev/tty && gh_authenticated="true"
+    else
+      echo "not a TTY; run: gh auth login -h github.com --git-protocol ssh --web" >&2
+    fi
+  else
+    echo "gh is already logged in to github.com." >&2
+  fi
+
+  if [[ "$gh_authenticated" == "true" ]]; then
+    gh auth setup-git -h github.com >/dev/null 2>&1 || gh auth setup-git >/dev/null 2>&1 || true
+
+    git_name_val="$(git config --global --get user.name 2>/dev/null || true)"
+    git_email_val="$(git config --global --get user.email 2>/dev/null || true)"
+
+    if [[ -z "$git_name_val" ]] || [[ -z "$git_email_val" ]]; then
+      api_login="$(GH_HOST=github.com gh api user -q .login 2>/dev/null || true)"
+
+      if [[ -n "$api_login" ]]; then
+        [[ -n "$git_name_val" ]] || git config --global user.name "$api_login" || true
+        [[ -n "$git_email_val" ]] || git config --global user.email "${api_login}@users.noreply.github.com" || true
+      fi
+    fi
+  fi
+}
+
+install_gcloud() {
+  command -v gcloud >/dev/null 2>&1 && return 0
+  pkg_as_root apt-get install -y -qq google-cloud-cli
+}
+
+version_gcloud() {
+  command -v gcloud >/dev/null 2>&1 || {
+    echo ""
+    return
+  }
+  gcloud version 2>/dev/null | sed -n 's/^Google Cloud SDK \([0-9][0-9.]*\).*/\1/p' | head -n1
+}
+
+upstream_gcloud() {
+  local body
+
+  body="$(http_get_body "https://dl.google.com/dl/cloudsdk/channels/rapid/components-2.json" 6 28)"
+  echo "$body" | head -c 196608 | grep -m1 -oE '"version"[[:space:]]*:[[:space:]]*"[0-9][0-9.]*"' | grep -oE '[0-9][0-9.]*' | head -n1
+}
+
+setup_gcloud() {
+  local active_account=""
+
+  command -v gcloud >/dev/null 2>&1 || return 0
+
+  banner "Google Cloud: gcloud auth login"
+
+  active_account="$(gcloud auth list --filter=status:ACTIVE --format='value(account)' 2>/dev/null | head -n1)"
+
+  if [[ -n "$active_account" ]]; then
+    echo "gcloud already active: ${active_account}" >&2
+    return 0
+  fi
+
+  if [[ ! -t 1 ]] || [[ ! -r /dev/tty ]] || [[ ! -w /dev/tty ]]; then
+    echo "run manually: gcloud auth login" >&2
+    return 0
+  fi
+
+  gcloud auth login </dev/tty || echo "gcloud auth login failed." >&2
+}
+
+install_docker() {
+  command -v docker >/dev/null 2>&1 && return 0
+  pkg_as_root apt-get install -y -qq docker.io
+}
+
+version_docker() {
+  command -v docker >/dev/null 2>&1 || {
+    echo ""
+    return
+  }
+  docker --version 2>/dev/null | sed -E 's/.*version ([0-9][0-9.]*).*/\1/' | head -n1
+}
+
+upstream_docker() {
+  echo "distro docker.io"
+}
+
+setup_docker() {
+  local target_user=""
+
+  getent group docker >/dev/null 2>&1 || {
+    echo "docker group missing; install docker.io first." >&2
+    return 0
+  }
+
+  target_user="${SUDO_USER:-}"
+  if [[ -z "$target_user" ]] && [[ "$(id -u)" -ne 0 ]]; then
+    target_user="$(id -un 2>/dev/null || true)"
+  fi
+  if [[ -z "$target_user" ]] && [[ "$(id -u)" -eq 0 ]]; then
+    target_user="$(logname 2>/dev/null || true)"
+  fi
+
+  if [[ -z "$target_user" || "$target_user" == "root" ]]; then
+    echo "could not determine login user for docker group; try: sudo usermod -aG docker \"\$USER\"" >&2
+    return 0
+  fi
+
+  if id -nG "$target_user" 2>/dev/null | tr ' ' '\n' | grep -qx docker; then
+    echo "user ${target_user} is already in the docker group." >&2
+    return 0
+  fi
+
+  banner "Docker: add ${target_user} to docker group"
+
+  if pkg_as_root usermod -aG docker "$target_user"; then
+    echo "re-login or run: newgrp docker" >&2
+  fi
+}
+
+install_kubectl() {
+  command -v kubectl >/dev/null 2>&1 && return 0
+  if apt_cache_has kubectl; then
+    pkg_as_root apt-get install -y -qq kubectl
+  else
+    echo "no apt package kubectl; skipped." >&2
+  fi
+}
+
+version_kubectl() {
+  command -v kubectl >/dev/null 2>&1 || {
+    echo ""
+    return
+  }
+  kubectl version --client=true -o json 2>/dev/null | grep -m1 -oE '"gitVersion"[[:space:]]*:[[:space:]]*"v[^"]+"' | grep -oE 'v[0-9][^"]*' | sed 's/^v//' | head -n1
+}
+
+upstream_kubectl() {
+  local stable
+
+  stable="$(http_get_body "https://storage.googleapis.com/kubernetes-release/release/stable.txt" 5 20)"
+  echo "${stable#v}"
+}
+
+setup_kubectl() {
+  :
+}
+
+install_helm() {
+  command -v helm >/dev/null 2>&1 && return 0
+  if apt_cache_has helm; then
+    pkg_as_root apt-get install -y -qq helm
+  else
+    echo "no apt package helm; skipped." >&2
+  fi
+}
+
+version_helm() {
+  command -v helm >/dev/null 2>&1 || {
+    echo ""
+    return
+  }
+  helm version --short 2>/dev/null | sed -E 's/^v([0-9][0-9.]*).*/\1/' | head -n1
+}
+
+upstream_helm() {
+  github_latest_tag "https://api.github.com/repos/helm/helm/releases/latest"
+}
+
+setup_helm() {
+  :
+}
+
+install_terraform() {
+  command -v terraform >/dev/null 2>&1 && return 0
+  if apt_cache_has terraform; then
+    pkg_as_root apt-get install -y -qq terraform
+  else
+    echo "no apt package terraform; skipped." >&2
+  fi
+}
+
+version_terraform() {
+  command -v terraform >/dev/null 2>&1 || {
+    echo ""
+    return
+  }
+  terraform version -json 2>/dev/null | grep -m1 -oE '"terraform_version"[[:space:]]*:[[:space:]]*"[^"]+"' | grep -oE '[0-9][0-9.]*' | head -n1
+}
+
+upstream_terraform() {
+  github_latest_tag "https://api.github.com/repos/hashicorp/terraform/releases/latest"
+}
+
+setup_terraform() {
+  :
+}
+
+# ---------------------------------------------------------------------------
+# Repositories: install (clone) / version / upstream / setup — one set per repo
+# ---------------------------------------------------------------------------
+
+repo_clone() {
+  local id="${1:?}"
+  local url="${2:?}"
+  local dirname="${3:?}"
+  local partial="${4:-0}"
+  local dest="$TEEMILL_ROOT/$dirname"
+
+  if [[ -d "$dest/.git" ]]; then
+    echo "skip (already a repo): $dest" >&2
+    return 0
+  fi
+
+  if [[ -e "$dest" ]] && [[ ! -d "$dest" ]]; then
+    echo "skip (path exists): $dest" >&2
+    return 0
+  fi
+
+  mkdir -p "$(dirname "$dest")" || return 1
+
+  if [[ "$partial" == "1" ]]; then
+    echo "cloning $id -> $dest (partial)" >&2
+    git clone --filter=blob:none "$url" "$dest"
+  else
+    echo "cloning $id -> $dest" >&2
+    git clone "$url" "$dest"
+  fi
+}
+
+repo_head_version() {
+  local dir="${1:?}"
+
+  if [[ -d "$dir/.git" ]]; then
+    git -C "$dir" rev-parse --short HEAD 2>/dev/null || echo ""
+  else
+    echo ""
+  fi
+}
+
+repo_upstream_label() {
+  printf '%s' "origin/main"
+}
+
+install_repo_core_api() {
+  repo_clone core-api git@github.com:Teemill/core-api.git core-api 0
+}
+
+version_repo_core_api() {
+  repo_head_version "$TEEMILL_ROOT/core-api"
+}
+
+upstream_repo_core_api() {
+  repo_upstream_label
+}
+
+setup_repo_core_api() {
+  :
+}
+
+install_repo_frontend() {
+  repo_clone frontend git@github.com:Teemill/frontend.git frontend 1
+}
+
+version_repo_frontend() {
+  repo_head_version "$TEEMILL_ROOT/frontend"
+}
+
+upstream_repo_frontend() {
+  repo_upstream_label
+}
+
+setup_repo_frontend() {
+  :
+}
+
+install_repo_frontend_legacy() {
+  repo_clone frontend-legacy git@github.com:Teemill/frontend.git frontend-legacy 1
+}
+
+version_repo_frontend_legacy() {
+  repo_head_version "$TEEMILL_ROOT/frontend-legacy"
+}
+
+upstream_repo_frontend_legacy() {
+  repo_upstream_label
+}
+
+setup_repo_frontend_legacy() {
+  :
+}
+
+install_repo_image_api() {
+  repo_clone image-api git@github.com:Teemill/image-api.git image-api 0
+}
+
+version_repo_image_api() {
+  repo_head_version "$TEEMILL_ROOT/image-api"
+}
+
+upstream_repo_image_api() {
+  repo_upstream_label
+}
+
+setup_repo_image_api() {
+  :
+}
+
+install_repo_enforcer() {
+  repo_clone enforcer git@github.com:Teemill/enforcer.git enforcer 0
+}
+
+version_repo_enforcer() {
+  repo_head_version "$TEEMILL_ROOT/enforcer"
+}
+
+upstream_repo_enforcer() {
+  repo_upstream_label
+}
+
+setup_repo_enforcer() {
+  :
+}
+
+install_repo_drive() {
+  repo_clone drive git@github.com:Teemill/drive.git drive 0
+}
+
+version_repo_drive() {
+  repo_head_version "$TEEMILL_ROOT/drive"
+}
+
+upstream_repo_drive() {
+  repo_upstream_label
+}
+
+setup_repo_drive() {
+  :
+}
+
+install_repo_file_processor() {
+  repo_clone file-processor git@github.com:Teemill/file-processor.git file-processor 0
+}
+
+version_repo_file_processor() {
+  repo_head_version "$TEEMILL_ROOT/file-processor"
+}
+
+upstream_repo_file_processor() {
+  repo_upstream_label
+}
+
+setup_repo_file_processor() {
+  :
+}
+
+install_repo_domain_manager() {
+  repo_clone domain-manager git@github.com:Teemill/domain-manager.git domain-manager 0
+}
+
+version_repo_domain_manager() {
+  repo_head_version "$TEEMILL_ROOT/domain-manager"
+}
+
+upstream_repo_domain_manager() {
+  repo_upstream_label
+}
+
+setup_repo_domain_manager() {
+  :
+}
+
+install_repo_metrics() {
+  repo_clone metrics git@github.com:Teemill/metrics.git metrics 0
+}
+
+version_repo_metrics() {
+  repo_head_version "$TEEMILL_ROOT/metrics"
+}
+
+upstream_repo_metrics() {
+  repo_upstream_label
+}
+
+setup_repo_metrics() {
+  :
+}
+
+install_repo_product_feed() {
+  repo_clone product-feed git@github.com:Teemill/product-feed.git product-feed 0
+}
+
+version_repo_product_feed() {
+  repo_head_version "$TEEMILL_ROOT/product-feed"
+}
+
+upstream_repo_product_feed() {
+  repo_upstream_label
+}
+
+setup_repo_product_feed() {
+  :
+}
+
+install_repo_infrastructure() {
+  repo_clone infrastructure git@github.com:Teemill/infrastructure.git infrastructure 0
+}
+
+version_repo_infrastructure() {
+  repo_head_version "$TEEMILL_ROOT/infrastructure"
+}
+
+upstream_repo_infrastructure() {
+  repo_upstream_label
+}
+
+setup_repo_infrastructure() {
+  :
+}
+
+
+
+# ---------------------------------------------------------------------------
+# Steps (main runs these in order after menus)
+# ---------------------------------------------------------------------------
+
+selected_contains() {
+  local want="${1:?}"
+  local id="${2:?}"
+  local x
+  for x in $want; do
+    if [[ "$x" == "$id" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+step_require_ubuntu() {
+  if ! command -v apt-get >/dev/null 2>&1; then
+    echo "install-simple requires Ubuntu/Debian with apt-get." >&2
+    exit 2
+  fi
+  local os_id=""
+  if [[ -r /etc/os-release ]]; then
+    os_id="$(grep -E '^ID=' /etc/os-release 2>/dev/null | head -n1 | cut -d= -f2- | tr -d '"' | tr -d "'")"
+    os_id="${os_id#"${os_id%%[![:space:]]*}"}"
+    os_id="${os_id%"${os_id##*[![:space:]]}"}"
+  fi
+  if [[ "$os_id" != "ubuntu" ]]; then
+    echo "install-simple targets Ubuntu (found ID=${os_id:-unknown}). Continuing." >&2
+  fi
+}
+
+step_prepare_workspace() {
+  mkdir -p "$TEEMILL_ROOT" || {
+    echo "could not create $TEEMILL_ROOT" >&2
+    exit 2
+  }
+  TEEMILL_ROOT="$(cd -- "$TEEMILL_ROOT" && pwd)"
+}
+
+step_prepare_apt_sources() {
+  export DEBIAN_FRONTEND=noninteractive
+  local need_google=0 need_gh=0
+  selected_contains "$SELECTED_TOOLS_LINE" gcloud && need_google=1
+  selected_contains "$SELECTED_TOOLS_LINE" gh && need_gh=1
+
+  banner "apt: update"
+  pkg_as_root apt-get update -qq
+
+  if [[ "$need_google" -eq 1 || "$need_gh" -eq 1 ]]; then
+    pkg_as_root apt-get install -y -qq ca-certificates curl gnupg dirmngr apt-transport-https
+  else
+    pkg_as_root apt-get install -y -qq ca-certificates || true
+  fi
+
+  local google_list=/etc/apt/sources.list.d/google-cloud-sdk.list
+  local google_key=/usr/share/keyrings/google-cloud-teemill.gpg
+  if [[ "$need_google" -eq 1 && ! -f "$google_list" ]]; then
+    curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | pkg_as_root gpg --batch --yes --dearmor -o "$google_key"
+    echo "deb [signed-by=${google_key}] https://packages.cloud.google.com/apt cloud-sdk main" | pkg_as_root tee "$google_list" >/dev/null
+  fi
+
+  local gh_list=/etc/apt/sources.list.d/github-cli.list
+  local gh_key=/usr/share/keyrings/githubcli-archive-keyring.gpg
+  if [[ "$need_gh" -eq 1 && ! -f "$gh_list" ]]; then
+    curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | pkg_as_root tee "$gh_key" >/dev/null
+    pkg_as_root chmod go+r "$gh_key" 2>/dev/null || true
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=${gh_key}] https://cli.github.com/packages stable main" | pkg_as_root tee "$gh_list" >/dev/null
+  fi
+
+  if [[ "$need_google" -eq 1 || "$need_gh" -eq 1 ]]; then
+    pkg_as_root apt-get update -qq
+  fi
+}
+
+step_install_toolchain() {
+  banner "Install selected toolchain packages"
+  local id
+  for id in $TOOL_IDS_ORDER; do
+    selected_contains "$SELECTED_TOOLS_LINE" "$id" || continue
+    if declare -f "install_${id}" >/dev/null 2>&1; then
+      "install_${id}"
+    fi
+  done
+}
+
+step_print_versions() {
+  banner "Installed vs upstream (selected tools)"
+  printf '%-12s %-18s %s\n' "tool" "installed" "upstream" >&2
+  printf '%-12s %-18s %s\n' "----" "----------" "--------" >&2
+  local id vfn ufn
+  for id in $TOOL_IDS_ORDER; do
+    selected_contains "$SELECTED_TOOLS_LINE" "$id" || continue
+    vfn="version_${id}"
+    ufn="upstream_${id}"
+    printf '%-12s %-18s %s\n' "$id" "$("$vfn")" "$("$ufn")" >&2
+  done
+}
+
+step_run_tool_setups() {
+  local id
+  for id in $TOOL_IDS_ORDER; do
+    selected_contains "$SELECTED_TOOLS_LINE" "$id" || continue
+    case "$id" in
+      git | gh | gcloud) continue ;;
+    esac
+    declare -f "setup_${id}" >/dev/null 2>&1 && "setup_${id}"
+  done
+  selected_contains "$SELECTED_TOOLS_LINE" gcloud && setup_gcloud
+  selected_contains "$SELECTED_TOOLS_LINE" git && setup_git
+  selected_contains "$SELECTED_TOOLS_LINE" gh && setup_gh
+}
+
+step_prompt_toolchain_menu() {
+  banner "Toolchain selection"
+  local -a picked=()
+  mapfile -t picked < <(prompt_tool_ids_cli)
+  SELECTED_TOOLS_LINE="${picked[*]}"
+  echo "selected tools: ${SELECTED_TOOLS_LINE:-<none>}" >&2
+}
+
+step_prompt_repo_menu() {
+  banner "Repository selection"
+  local -a picked=()
+  mapfile -t picked < <(prompt_repo_ids_cli "$TEEMILL_ROOT")
+  printf '%s\n' "${picked[@]}"
+}
+
+step_clone_selected_repos() {
+  local -a ids=()
+  mapfile -t ids < <(step_prompt_repo_menu)
+  if [[ "${#ids[@]}" -eq 0 ]]; then
+    echo "no repositories selected; skipping clones." >&2
+    return 0
+  fi
+  banner "Clone Teemill repositories (SSH)"
+  local rid safe fn
+  for rid in "${ids[@]}"; do
+    rid="${rid// /}"
+    [[ -z "$rid" ]] && continue
+    safe="${rid//-/_}"
+    fn="install_repo_${safe}"
+    if declare -f "$fn" >/dev/null 2>&1; then
+      "$fn"
+    else
+      echo "unknown repository id: $rid" >&2
+      exit 2
+    fi
+  done
+}
+
+usage() {
+  cat <<'EOF'
+Usage: bash install-simple
+
+  Ubuntu + apt. Arrow keys + Space toggle toolchain packages and repositories; Enter confirms.
+  Without a TTY, use numbered multi-select. TEEMILL_ROOT defaults to ~/teemill.
+
+  Optional: TEEMILL_ROOT=/path/to/workspace bash install-simple
+EOF
+}
+
+main() {
+  if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+    usage
+    exit 0
+  fi
+  if [[ $# -gt 0 ]]; then
+    echo "install-simple takes no arguments (use TEEMILL_ROOT). Got: $*" >&2
+    usage >&2
+    exit 2
+  fi
+
+  TEEMILL_ROOT="$DEFAULT_TEEMILL_ROOT"
+
+  step_require_ubuntu
+  step_prepare_workspace
+  step_prompt_toolchain_menu
+
+  if [[ -z "${SELECTED_TOOLS_LINE// }" ]]; then
+    echo "no toolchain packages selected; skipping installs and auth helpers that need tools." >&2
+  else
+    step_prepare_apt_sources
+    step_install_toolchain
+    step_print_versions
+    step_run_tool_setups
+  fi
+
+  step_clone_selected_repos
+
+  banner "Done"
+  echo "workspace: $TEEMILL_ROOT" >&2
+}
+
+main "$@"
