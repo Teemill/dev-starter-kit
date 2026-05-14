@@ -829,6 +829,194 @@ is_browser_manifest_line_installed() {
   is_browser_id_installed "$browser_id"
 }
 
+_teemill_toggle_version_or_dash() {
+  local value="${1:-}"
+
+  value="${value//$'\n'/ }"
+  value="${value//[[:space:]]/}"
+
+  if [[ -z "$value" ]]; then
+    printf '-'
+
+    return
+  fi
+
+  if [[ "${#value}" -gt 14 ]]; then
+    printf '%s' "${value:0:14}"
+
+    return
+  fi
+
+  printf '%s' "$value"
+}
+
+_toolchain_manifest_line_installed() {
+  local _root="$1"
+  local manifest_line="$2"
+  local tool_id
+
+  tool_id="$(manifest_field "$manifest_line" 1)"
+
+  case "$tool_id" in
+    curl) command -v curl >/dev/null 2>&1 ;;
+    git) command -v git >/dev/null 2>&1 ;;
+    gh) command -v gh >/dev/null 2>&1 ;;
+    gcloud) command -v gcloud >/dev/null 2>&1 ;;
+    docker) command -v docker >/dev/null 2>&1 ;;
+    kubectl) command -v kubectl >/dev/null 2>&1 ;;
+    helm) command -v helm >/dev/null 2>&1 ;;
+    terraform) command -v terraform >/dev/null 2>&1 ;;
+    *) return 1 ;;
+  esac
+}
+
+_teemill_toggle_toolchain_installed_version() {
+  local _root="$1"
+  local manifest_line="$2"
+  local tool_id raw
+
+  tool_id="$(manifest_field "$manifest_line" 1)"
+
+  case "$tool_id" in
+    curl) raw="$(_installed_version_curl)" ;;
+    git) raw="$(_installed_version_git)" ;;
+    gh) raw="$(_installed_version_gh)" ;;
+    gcloud) raw="$(_installed_version_gcloud_sdk)" ;;
+    docker) raw="$(_installed_version_docker)" ;;
+    kubectl) raw="$(_installed_version_kubectl)" ;;
+    helm) raw="$(_installed_version_helm)" ;;
+    terraform) raw="$(_installed_version_terraform)" ;;
+    *) raw="" ;;
+  esac
+
+  _teemill_toggle_version_or_dash "$raw"
+}
+
+_teemill_toggle_toolchain_target_version() {
+  local _root="$1"
+  local manifest_line="$2"
+  local tool_id raw
+
+  tool_id="$(manifest_field "$manifest_line" 1)"
+
+  case "$tool_id" in
+    curl) raw="$(_latest_upstream_curl_tag)" ;;
+    git) raw="$(_latest_upstream_git_tag)" ;;
+    gh) raw="$(_latest_upstream_gh_tag)" ;;
+    gcloud) raw="$(_latest_upstream_gcloud_version)" ;;
+    docker) printf 'distro'; return ;;
+    kubectl) raw="$(_latest_upstream_kubectl_version)" ;;
+    helm) raw="$(_latest_upstream_helm_tag)" ;;
+    terraform) raw="$(_latest_upstream_terraform_tag)" ;;
+    *) raw="" ;;
+  esac
+
+  _teemill_toggle_version_or_dash "$raw"
+}
+
+_teemill_toggle_browser_installed_version() {
+  local _root="$1"
+  local manifest_line="$2"
+  local browser_id raw line
+
+  browser_id="$(manifest_field "$manifest_line" 1)"
+  raw=""
+
+  case "$browser_id" in
+    firefox)
+      line="$({ firefox --version 2>/dev/null || firefox-esr --version 2>/dev/null || true; } | head -n1)"
+      raw="$(echo "$line" | sed -E 's/.* ([0-9][0-9.]*).*/\1/')"
+      ;;
+    chrome)
+      line="$({ google-chrome-stable --version 2>/dev/null || google-chrome --version 2>/dev/null || true; } | head -n1)"
+      raw="$(echo "$line" | sed -E 's/.* ([0-9][0-9.]*).*/\1/')"
+      ;;
+  esac
+
+  if [[ "$browser_id" == "firefox" ]] && [[ -z "${raw// }" ]] && [[ -d "/Applications/Firefox.app" ]]; then
+    raw="(app)"
+  fi
+
+  if [[ "$browser_id" == "chrome" ]] && [[ -z "${raw// }" ]] && [[ -d "/Applications/Google Chrome.app" ]]; then
+    raw="(app)"
+  fi
+
+  _teemill_toggle_version_or_dash "$raw"
+}
+
+_teemill_toggle_browser_target_version() {
+  local _root="$1"
+  local manifest_line="$2"
+  local browser_id candidate
+
+  browser_id="$(manifest_field "$manifest_line" 1)"
+
+  if command -v apt-cache >/dev/null 2>&1; then
+    case "$browser_id" in
+      firefox)
+        candidate="$(apt-cache policy firefox 2>/dev/null | sed -n 's/^  Candidate: \(.\{1,80\}\)$/\1/p' | head -n1)"
+        ;;
+      chrome)
+        candidate="$(apt-cache policy google-chrome-stable 2>/dev/null | sed -n 's/^  Candidate: \(.\{1,80\}\)$/\1/p' | head -n1)"
+        ;;
+    esac
+
+    if [[ -n "${candidate:-}" && "$candidate" != "(none)" ]]; then
+      _teemill_toggle_version_or_dash "$candidate"
+
+      return
+    fi
+  fi
+
+  if [[ "$(uname -s)" == "Darwin" ]] && command -v brew >/dev/null 2>&1; then
+    case "$browser_id" in
+      firefox | chrome)
+        printf 'brew-cask'
+
+        return
+        ;;
+    esac
+  fi
+
+  printf 'pkg-feed'
+}
+
+_teemill_toggle_repo_installed_version() {
+  local teemill_root="$1"
+  local manifest_line="$2"
+  local dest rev
+
+  dest="$(manifest_clone_target_path "$teemill_root" "$manifest_line")"
+
+  if [[ ! -d "$dest/.git" ]]; then
+    printf '-'
+
+    return
+  fi
+
+  rev="$(git -C "$dest" rev-parse --short HEAD 2>/dev/null)"
+
+  _teemill_toggle_version_or_dash "$rev"
+}
+
+_teemill_toggle_repo_target_version() {
+  local _root="$1"
+  local manifest_line="$2"
+  local url head
+
+  url="$(manifest_field "$manifest_line" 3)"
+
+  if [[ -z "$url" ]]; then
+    printf '-'
+
+    return
+  fi
+
+  head="$(GIT_SSH_COMMAND="ssh -o BatchMode=yes -o ConnectTimeout=5" timeout 10 git ls-remote "$url" HEAD 2>/dev/null | awk '{print substr($1,1,9)}')"
+
+  _teemill_toggle_version_or_dash "$head"
+}
+
 _debian_ensure_google_chrome_apt_repo() {
   local chrome_list=/etc/apt/sources.list.d/google-chrome-teemill.list
   local chrome_key=/usr/share/keyrings/google-chrome-linux-teemill.gpg
@@ -1608,6 +1796,48 @@ _teemill_resolve_terminal_desktop_basename() {
   printf ''
 }
 
+_teemill_print_ide_status_for_prompt() {
+  local line tb candidate
+
+  echo "  Cursor:" >&2
+
+  if command -v cursor >/dev/null 2>&1; then
+    line="$(cursor --version 2>/dev/null | head -n1 || true)"
+    echo "    on PATH${line:+  $line}" >&2
+  elif _is_cursor_user_install_present; then
+    echo "    user AppImage at ~/.local/share/teemill-cursor/Cursor.AppImage" >&2
+  elif [[ -d "/Applications/Cursor.app" ]]; then
+    line="$("/Applications/Cursor.app/Contents/MacOS/Cursor" --version 2>/dev/null | head -n1 || true)"
+    echo "    macOS app${line:+  $line}" >&2
+  else
+    echo "    not detected" >&2
+  fi
+
+  echo "    target: vendor download or brew --cask (install step)" >&2
+
+  echo "  JetBrains Toolbox:" >&2
+
+  if _is_jetbrains_toolbox_user_binary_present; then
+    for candidate in \
+      "${HOME}/.local/bin/jetbrains-toolbox" \
+      "${HOME}/.local/share/teemill-jetbrains-toolbox/jetbrains-toolbox" \
+      "${HOME}/Applications/jetbrains-toolbox/jetbrains-toolbox"; do
+      if [[ -x "$candidate" ]]; then
+        tb="$("$candidate" --version 2>/dev/null | head -n1 || true)"
+        echo "    ${candidate/#$HOME/\~}${tb:+  $tb}" >&2
+
+        break
+      fi
+    done
+  elif command -v brew >/dev/null 2>&1 && brew list --cask jetbrains-toolbox &>/dev/null; then
+    echo "    Homebrew cask jetbrains-toolbox" >&2
+  else
+    echo "    not detected" >&2
+  fi
+
+  echo "    target: JetBrains releases API + tarball (install step)" >&2
+}
+
 # Prints cursor | jetbrains-toolbox | skip on stdout. assume_yes=true skips the prompt (defaults to cursor).
 prompt_teemill_primary_ide() {
   local assume_yes="${1:-false}"
@@ -1624,6 +1854,9 @@ prompt_teemill_primary_ide() {
     return 0
   fi
 
+  echo "" >&2
+  echo "teemill-install: detected IDE status (best effort)" >&2
+  _teemill_print_ide_status_for_prompt
   echo "" >&2
   echo "teemill-install: primary IDE (install + Ubuntu dock); pick one" >&2
   printf '  1) Cursor  2) JetBrains Toolbox  3) Skip  [1] ' >&2
@@ -2463,8 +2696,9 @@ Usage: install [options]
 
   Clones Teemill repos into ~/teemill (created if missing). First pick toolchain packages (defaults:
   curl, git, gh, gcloud, docker; optional: kubectl, helm, terraform) using the same arrow/Space menu as
-  repos (numbered fallback without a TTY). A version summary is shown only for selected tools, then packages
-  are installed. Then pick a primary IDE (Cursor, JetBrains Toolbox, or skip) on /dev/tty; best-effort install
+  repos (numbered fallback without a TTY). Toolchain, repo, and browser pickers show [✓] when already present
+  and two columns (installed -> target, best effort). A version summary is shown only for selected tools, then
+  packages are installed. Then pick a primary IDE (Cursor, JetBrains Toolbox, or skip) on /dev/tty; best-effort install
   runs before optional browsers. Use --yes for non-interactive runs: default toolchain selection, default repo clone set,
   default browser bundle, and default IDE (Cursor) without prompts.
 
@@ -2600,20 +2834,24 @@ read_menu_key() {
   printf 'NONE'
 }
 
-# Toggle-menu installed predicate: toolchain rows are never treated as pre-installed.
-_manifest_row_never_installed() {
-  return 1
-}
-
-# Same TTY UX as repos / browsers; delegates to run_toggle_arrow_menu.
+# Same TTY UX as repos / browsers; shows on-PATH tools with [✓] and installed vs upstream columns.
 run_tool_arrow_menu() {
+  local menu_status=0
+
+  TEEMILL_TOGGLE_VERSION_INSTALLED_FN=_teemill_toggle_toolchain_installed_version
+  TEEMILL_TOGGLE_VERSION_TARGET_FN=_teemill_toggle_toolchain_target_version
+
   run_toggle_arrow_menu \
     "Toolchain packages  (install / upgrade)" \
-    "  ↑/↓ move   Space toggle   Enter confirm   q quit" \
+    $'  [✓] = already on PATH  |  columns: installed -> target (upstream / distro; best effort)\n  ↑/↓ move (rows not yet on PATH)   Space toggle   Enter confirm   q quit' \
     "" \
-    _manifest_row_never_installed \
+    _toolchain_manifest_line_installed \
     "$DEFAULT_SELECTED_TOOL_IDS" \
-    "$@"
+    "$@" || menu_status=$?
+
+  unset TEEMILL_TOGGLE_VERSION_INSTALLED_FN TEEMILL_TOGGLE_VERSION_TARGET_FN
+
+  return "$menu_status"
 }
 
 # Draws on fd 3; prints selected manifest ids (field 1) to stdout (one per line) on Enter.
@@ -2709,15 +2947,53 @@ run_toggle_arrow_menu() {
     local with_cursor_highlight="$2"
     local screen_line=$((menu_screen_header_lines + 1 + row_index))
     local manifest_line display_id description row_mark
+    local vi="-"
+    local vt="-"
 
     manifest_line="${manifest_lines[row_index]}"
     display_id="$(manifest_field "$manifest_line" 1)"
     description="$(manifest_field "$manifest_line" 2)"
 
+    if [[ -n "${TEEMILL_TOGGLE_VERSION_INSTALLED_FN:-}" ]]; then
+      vi="$("$TEEMILL_TOGGLE_VERSION_INSTALLED_FN" "$root_for_installed" "$manifest_line")"
+      [[ -z "${vi// }" ]] && vi="-"
+    fi
+
+    if [[ -n "${TEEMILL_TOGGLE_VERSION_TARGET_FN:-}" ]]; then
+      vt="$("$TEEMILL_TOGGLE_VERSION_TARGET_FN" "$root_for_installed" "$manifest_line")"
+      [[ -z "${vt// }" ]] && vt="-"
+    fi
+
+    vi="${vi:0:14}"
+    vt="${vt:0:14}"
+
     printf '\e[%d;1H\e[K' "$screen_line" >&3
+
+    if [[ -n "${TEEMILL_TOGGLE_VERSION_INSTALLED_FN:-}" || -n "${TEEMILL_TOGGLE_VERSION_TARGET_FN:-}" ]]; then
+      if [[ "${installed[row_index]:-0}" -eq 1 ]]; then
+        printf '  \e[32m%s  %-14s  %-14s  %-14s  %s\e[0m' '[✓]' "$display_id" "$vi" "$vt" "$description" >&3
+
+        return
+      fi
+
+      row_mark="[ ]"
+
+      if [[ "${selected[row_index]:-0}" -eq 1 ]]; then
+        row_mark="[x]"
+      fi
+
+      if [[ "$with_cursor_highlight" -eq 1 ]]; then
+        printf '  \e[7m%s  %-14s  %-14s  %-14s  %s\e[0m' "$row_mark" "$display_id" "$vi" "$vt" "$description" >&3
+      else
+        printf '  %s  %-14s  %-14s  %-14s  %s' "$row_mark" "$display_id" "$vi" "$vt" "$description" >&3
+      fi
+
+      return
+    fi
 
     if [[ "${installed[row_index]:-0}" -eq 1 ]]; then
       printf '  \e[32m%s  %-18s  %s\e[0m' '[✓]' "$display_id" "$description" >&3
+
       return
     fi
 
@@ -2828,6 +3104,7 @@ run_toggle_arrow_menu() {
 
 run_repo_arrow_menu() {
   local teemill_root="$1"
+  local menu_status=0
   shift
   local -a manifest_lines=("$@")
 
@@ -2835,23 +3112,39 @@ run_repo_arrow_menu() {
     teemill_root="$(cd -- "$teemill_root" && pwd)"
   fi
 
+  TEEMILL_TOGGLE_VERSION_INSTALLED_FN=_teemill_toggle_repo_installed_version
+  TEEMILL_TOGGLE_VERSION_TARGET_FN=_teemill_toggle_repo_target_version
+
   run_toggle_arrow_menu \
     "Teemill repositories  (clone into: $teemill_root)" \
-    "  ↑/↓ move (repos to clone only)   Space toggle   Enter confirm   q quit" \
+    $'  [✓] = already cloned  |  columns: local HEAD -> remote HEAD (best effort; needs SSH to GitHub)\n  ↑/↓ move (repos to clone only)   Space toggle   Enter confirm   q quit' \
     "$teemill_root" \
     is_manifest_repo_installed \
     "$DEFAULT_SELECTED_IDS" \
-    "${manifest_lines[@]}"
+    "${manifest_lines[@]}" || menu_status=$?
+
+  unset TEEMILL_TOGGLE_VERSION_INSTALLED_FN TEEMILL_TOGGLE_VERSION_TARGET_FN
+
+  return "$menu_status"
 }
 
 run_browser_arrow_menu() {
+  local menu_status=0
+
+  TEEMILL_TOGGLE_VERSION_INSTALLED_FN=_teemill_toggle_browser_installed_version
+  TEEMILL_TOGGLE_VERSION_TARGET_FN=_teemill_toggle_browser_target_version
+
   run_toggle_arrow_menu \
     "Browsers (optional desktop)" \
-    "  ↑/↓ move   Space toggle   Enter confirm   q quit" \
+    $'  [✓] = already detected  |  columns: installed -> target (apt Candidate / brew-cask / feed)\n  ↑/↓ move   Space toggle   Enter confirm   q quit' \
     "" \
     is_browser_manifest_line_installed \
     "$DEFAULT_SELECTED_BROWSER_IDS" \
-    "$@"
+    "$@" || menu_status=$?
+
+  unset TEEMILL_TOGGLE_VERSION_INSTALLED_FN TEEMILL_TOGGLE_VERSION_TARGET_FN
+
+  return "$menu_status"
 }
 
 # HEREDOC-style manifest blocks: drop blank lines and #-comments.
@@ -2948,6 +3241,7 @@ prompt_toggle_ids_fallback_numbers() {
   local reply normalized token start end i j
   local manifest_line
   local -a row_installed=()
+  local vi vt
 
   if [[ -n "$root_for_installed" ]] && [[ -d "$root_for_installed" ]]; then
     root_for_installed="$(cd -- "$root_for_installed" && pwd)"
@@ -2966,6 +3260,11 @@ prompt_toggle_ids_fallback_numbers() {
   printf '%s\n' "$title_line" >&2
   echo >&2
 
+  if [[ -n "${TEEMILL_TOGGLE_VERSION_INSTALLED_FN:-}" || -n "${TEEMILL_TOGGLE_VERSION_TARGET_FN:-}" ]]; then
+    echo "  Legend: installed -> target (best effort)." >&2
+    echo >&2
+  fi
+
   index=1
 
   for ((j = 0; j < count; j++)); do
@@ -2973,16 +3272,44 @@ prompt_toggle_ids_fallback_numbers() {
     display_id="$(manifest_field "$manifest_line" 1)"
     description="$(manifest_field "$manifest_line" 2)"
     marker=" "
+    vi="-"
+    vt="-"
 
-    if [[ "${row_installed[j]:-0}" -eq 1 ]]; then
-      marker='[✓]'
-      printf '  \e[32m%s  %2d  %-20s  %s\e[0m\n' "$marker" "$index" "$display_id" "$description" >&2
-    else
-      if is_id_in_default_list "$default_ids_string" "$display_id"; then
-        marker="*"
+    if [[ -n "${TEEMILL_TOGGLE_VERSION_INSTALLED_FN:-}" ]]; then
+      vi="$("$TEEMILL_TOGGLE_VERSION_INSTALLED_FN" "$root_for_installed" "$manifest_line")"
+      [[ -z "${vi// }" ]] && vi="-"
+    fi
+
+    if [[ -n "${TEEMILL_TOGGLE_VERSION_TARGET_FN:-}" ]]; then
+      vt="$("$TEEMILL_TOGGLE_VERSION_TARGET_FN" "$root_for_installed" "$manifest_line")"
+      [[ -z "${vt// }" ]] && vt="-"
+    fi
+
+    vi="${vi:0:14}"
+    vt="${vt:0:14}"
+
+    if [[ -n "${TEEMILL_TOGGLE_VERSION_INSTALLED_FN:-}" || -n "${TEEMILL_TOGGLE_VERSION_TARGET_FN:-}" ]]; then
+      if [[ "${row_installed[j]:-0}" -eq 1 ]]; then
+        marker='[✓]'
+        printf '  \e[32m%s  %2d  %-12s  %-14s  %-14s  %s\e[0m\n' "$marker" "$index" "$display_id" "$vi" "$vt" "$description" >&2
+      else
+        if is_id_in_default_list "$default_ids_string" "$display_id"; then
+          marker="*"
+        fi
+
+        printf '  %s  %2d  %-12s  %-14s  %-14s  %s\n' "$marker" "$index" "$display_id" "$vi" "$vt" "$description" >&2
       fi
+    else
+      if [[ "${row_installed[j]:-0}" -eq 1 ]]; then
+        marker='[✓]'
+        printf '  \e[32m%s  %2d  %-20s  %s\e[0m\n' "$marker" "$index" "$display_id" "$description" >&2
+      else
+        if is_id_in_default_list "$default_ids_string" "$display_id"; then
+          marker="*"
+        fi
 
-      printf '  %s  %2d  %-20s  %s\n' "$marker" "$index" "$display_id" "$description" >&2
+        printf '  %s  %2d  %-20s  %s\n' "$marker" "$index" "$display_id" "$description" >&2
+      fi
     fi
 
     index=$((index + 1))
@@ -3100,6 +3427,9 @@ prompt_repo_ids_fallback_numbers() {
   local teemill_root="$1"
   shift
 
+  TEEMILL_TOGGLE_VERSION_INSTALLED_FN=_teemill_toggle_repo_installed_version
+  TEEMILL_TOGGLE_VERSION_TARGET_FN=_teemill_toggle_repo_target_version
+
   prompt_toggle_ids_fallback_numbers \
     "$teemill_root" \
     "Teemill repos (clone into: $teemill_root)  (no TTY: type numbers instead of arrow keys)" \
@@ -3109,9 +3439,14 @@ prompt_repo_ids_fallback_numbers() {
     "[✓] = already cloned under this path (skipped for defaults, \"all\", and numbers)." \
     "Which to clone? [default bundle] " \
     "$@"
+
+  unset TEEMILL_TOGGLE_VERSION_INSTALLED_FN TEEMILL_TOGGLE_VERSION_TARGET_FN
 }
 
 prompt_browser_ids_fallback_numbers() {
+  TEEMILL_TOGGLE_VERSION_INSTALLED_FN=_teemill_toggle_browser_installed_version
+  TEEMILL_TOGGLE_VERSION_TARGET_FN=_teemill_toggle_browser_target_version
+
   prompt_toggle_ids_fallback_numbers \
     "" \
     "Browsers (optional)  (no TTY: type numbers instead of arrow keys)" \
@@ -3121,6 +3456,8 @@ prompt_browser_ids_fallback_numbers() {
     "[✓] = already installed (skipped for defaults, \"all\", and numbers)." \
     "Which to install? [default bundle] " \
     "$@"
+
+  unset TEEMILL_TOGGLE_VERSION_INSTALLED_FN TEEMILL_TOGGLE_VERSION_TARGET_FN
 }
 
 prompt_browser_ids_cli() {
@@ -3193,15 +3530,20 @@ emit_default_repo_ids_for_teemill_root() {
 }
 
 prompt_tool_ids_fallback_numbers() {
+  TEEMILL_TOGGLE_VERSION_INSTALLED_FN=_teemill_toggle_toolchain_installed_version
+  TEEMILL_TOGGLE_VERSION_TARGET_FN=_teemill_toggle_toolchain_target_version
+
   prompt_toggle_ids_fallback_numbers \
     "" \
     "Toolchain packages  (no TTY: type numbers instead of arrow keys)" \
-    _manifest_row_never_installed \
+    _toolchain_manifest_line_installed \
     "$DEFAULT_SELECTED_TOOL_IDS" \
     "* = default toolchain bundle." \
     "" \
     "Which tools to install? [default bundle] " \
     "$@"
+
+  unset TEEMILL_TOGGLE_VERSION_INSTALLED_FN TEEMILL_TOGGLE_VERSION_TARGET_FN
 }
 
 prompt_tool_ids_cli() {
