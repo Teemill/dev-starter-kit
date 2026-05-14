@@ -5,11 +5,12 @@
 # git clone --filter=blob:none to keep the initial download small. Toolchain is a multi-select step (same UX as repos: arrows,
 # Space toggles, Enter confirms; numbered fallback): defaults on for curl, git, gh, gcloud, docker;
 # kubectl, helm, and terraform are optional (off by default). Shows a version summary for selected tools,
-# then installs (Debian uses docker.io from default repos, not Docker CE). --yes skips prompts and uses
+# then installs (Linux: distro Docker packages + docker group for passwordless CLI; macOS: Homebrew when available).
+# --yes skips prompts and uses
 # default toolchain ids plus default repo clone set. --dry-run prints resolved toolchain package names
 # and git clone commands instead of mutating the system.
-# gcloud auth login runs when gcloud is among selected tools; git/gh + GitHub SSH + gh login follow when
-# a TTY allows it.
+# gcloud auth login runs when gcloud is on PATH (after toolchain install or if already installed), except
+# --dry-run; git/gh + GitHub SSH + gh login follow when a TTY allows it.
 # On Ubuntu (strict ID=ubuntu from /etc/os-release) with GNOME Shell, optionally resets the dock favorites
 # to default browser + IDE + terminal via gsettings (org.gnome.shell favorite-apps) when those .desktop
 # entries can be resolved (browser from the desktop default, IDE from the first installed cursor.desktop or
@@ -271,7 +272,7 @@ _print_selected_toolchain_version_summary() {
   fi
 
   if _selected_line_contains_tool_id "$selected_line" "docker"; then
-    printf '%-10s  %-18s  %-18s  %s\n' "docker" "${cur_docker:-(none)}" "(distro)" "docker.io / distro docker (no Docker CE apt repo)" >&2
+    printf '%-10s  %-18s  %-18s  %s\n' "docker" "${cur_docker:-(none)}" "(distro)" "docker.io / distro; user added to docker group (re-login for no sudo)" >&2
   fi
 
   if _selected_line_contains_tool_id "$selected_line" "kubectl"; then
@@ -759,6 +760,49 @@ _install_toolchain_zypper() {
   fi
 }
 
+# Linux: add the login user to group "docker" so docker(1) can use the daemon socket without sudo.
+# Requires a one-time privileged usermod (same sudo path as package installs). New group membership applies after re-login or: newgrp docker
+_teemill_add_login_user_to_docker_group_if_wanted() {
+  local want="${1:?}"
+  local target_user=""
+
+  [[ "$(uname -s)" == "Linux" ]] || return 0
+  _selected_line_contains_tool_id "$want" "docker" || return 0
+  getent group docker >/dev/null 2>&1 || {
+    echo "teemill-install: docker group not found; skipping usermod (install docker package first)." >&2
+    return 0
+  }
+
+  target_user="${SUDO_USER:-}"
+
+  if [[ -z "$target_user" ]] && [[ "$(id -u)" -ne 0 ]]; then
+    target_user="$(id -un 2>/dev/null || true)"
+  fi
+
+  if [[ -z "$target_user" ]] && [[ "$(id -u)" -eq 0 ]]; then
+    target_user="$(logname 2>/dev/null || true)"
+  fi
+
+  if [[ -z "$target_user" || "$target_user" == "root" ]]; then
+    echo "teemill-install: could not determine a non-root login user; add yourself to docker manually: sudo usermod -aG docker \"\$USER\"" >&2
+    return 0
+  fi
+
+  if id -nG "$target_user" 2>/dev/null | tr ' ' '\n' | grep -qx docker; then
+    echo "teemill-install: user ${target_user} is already in the docker group." >&2
+    return 0
+  fi
+
+  _teemill_install_major_step "Docker: add user to docker group (no sudo for docker(1) after re-login)"
+  echo "" >&2
+
+  if _pkg_as_root usermod -aG docker "$target_user"; then
+    echo "teemill-install: added ${target_user} to group docker — log out and back in, or run: newgrp docker  (then docker commands work without sudo)." >&2
+  else
+    echo "teemill-install: usermod -aG docker ${target_user} failed; run manually with sudo when you can." >&2
+  fi
+}
+
 install_toolchain_for_platform() {
   local want="${1:-}"
 
@@ -772,37 +816,24 @@ install_toolchain_for_platform() {
   fi
 
   if command -v apt-get >/dev/null 2>&1; then
-    _install_toolchain_debian "$want"
-    return
+    _install_toolchain_debian "$want" || return $?
+  elif command -v dnf >/dev/null 2>&1; then
+    _install_toolchain_dnf "$want" || return $?
+  elif command -v yum >/dev/null 2>&1; then
+    _install_toolchain_yum "$want" || return $?
+  elif command -v zypper >/dev/null 2>&1; then
+    _install_toolchain_zypper "$want" || return $?
+  elif command -v pacman >/dev/null 2>&1; then
+    _install_toolchain_pacman "$want" || return $?
+  elif command -v apk >/dev/null 2>&1; then
+    _install_toolchain_apk "$want" || return $?
+  else
+    echo "teemill-install: no supported package manager; install selected tools manually." >&2
+    return 1
   fi
 
-  if command -v dnf >/dev/null 2>&1; then
-    _install_toolchain_dnf "$want"
-    return
-  fi
-
-  if command -v yum >/dev/null 2>&1; then
-    _install_toolchain_yum "$want"
-    return
-  fi
-
-  if command -v zypper >/dev/null 2>&1; then
-    _install_toolchain_zypper "$want"
-    return
-  fi
-
-  if command -v pacman >/dev/null 2>&1; then
-    _install_toolchain_pacman "$want"
-    return
-  fi
-
-  if command -v apk >/dev/null 2>&1; then
-    _install_toolchain_apk "$want"
-    return
-  fi
-
-  echo "teemill-install: no supported package manager; install selected tools manually." >&2
-  return 1
+  _teemill_add_login_user_to_docker_group_if_wanted "$want"
+  return 0
 }
 
 
@@ -931,6 +962,10 @@ _teemill_toggle_repo_target_version() {
 
 _run_gcloud_auth_login_step() {
   local active_account
+
+  if ! command -v gcloud >/dev/null 2>&1; then
+    return 0
+  fi
 
   _teemill_install_major_step "Google Cloud: gcloud auth login"
   echo "" >&2
@@ -1397,6 +1432,10 @@ bootstrap_environment() {
     echo "" >&2
     echo "teemill-install: no toolchain packages selected; skipping toolchain install and version summary." >&2
 
+    if [[ "$dry_run" != "true" ]]; then
+      _run_gcloud_auth_login_step
+    fi
+
     _configure_git_gh_ssh_and_auth_step
 
     _teemill_install_major_step "Next: clone Teemill repositories over SSH"
@@ -1467,9 +1506,7 @@ bootstrap_environment() {
     exit 2
   fi
 
-  if _selected_line_contains_tool_id "$selected_tools_line" "gcloud"; then
-    _run_gcloud_auth_login_step
-  fi
+  _run_gcloud_auth_login_step
 
   _configure_git_gh_ssh_and_auth_step
 
@@ -1504,7 +1541,7 @@ curl|curl (HTTP client)|
 git|git (version control)|
 gh|GitHub CLI (gh)|
 gcloud|Google Cloud SDK (gcloud)|
-docker|Docker (CLI; distro/engine varies by OS)|
+docker|Docker (distro engine; user in docker group = no sudo for docker(1))|
 kubectl|kubectl (Kubernetes CLI)|
 helm|Helm (Kubernetes package manager)|
 terraform|Terraform (IaC)|
@@ -1524,8 +1561,8 @@ Usage: install [options]
   packages are installed. Use --yes for non-interactive runs: default toolchain selection and default repo clone set
   without prompts.
 
-  When gcloud is selected, runs gcloud auth login when there is no active gcloud account and a terminal is
-  available (otherwise prints a reminder to run it manually).
+  When gcloud is on PATH, runs gcloud auth login when there is no active gcloud account and a terminal is
+  available (otherwise prints a reminder to run it manually). Skipped under --dry-run.
 
   Then configures GitHub over SSH for git/gh: default SSH key (or optional interactive
   ssh-keygen), ssh-add / macOS Keychain, Linux ~/.ssh/config Host github.com hints, gh
@@ -1556,9 +1593,9 @@ Environment:
   TEEMILL_DEBUG  Set to 1 for extra stderr when Ubuntu dock favorites are skipped
 
 Dependencies:
-  sudo on Linux when not root. Upstream version checks use curl when present, otherwise wget.
-  Debian/Ubuntu Docker CLI comes from docker.io in default apt repos (no Docker CE repository).
-  After toolchain install, gcloud login when gcloud was selected, then git/gh + GitHub SSH + gh auth when a TTY allows it.
+  sudo on Linux when not root (package installs and adding your user to the docker group). Upstream version checks use curl when present, otherwise wget.
+  Docker on Linux is the distro docker.io / docker package; the script adds your login user to the docker group so docker(1) can use the socket without sudo after you re-login or run newgrp docker. macOS uses brew install docker when Homebrew is available.
+  After toolchain install (or if gcloud is already on PATH), gcloud auth login when appropriate, then git/gh + GitHub SSH + gh auth when a TTY allows it.
 EOF
 }
 
