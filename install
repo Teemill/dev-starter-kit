@@ -1,0 +1,672 @@
+#!/usr/bin/env bash
+# Clone selected Teemill GitHub repositories into your teemill workspace.
+# Interactive list on your terminal: arrow keys move, Space toggles, Enter confirms.
+# Falls back to typing numbers if /dev/tty is not usable.
+
+set -u
+
+trap '' PIPE
+
+readonly DEFAULT_TEEMILL_ROOT="${TEEMILL_ROOT:-$HOME/teemill}"
+
+# Repositories offered. Format:
+#   id|description|clone_url|target_directory
+# If target_directory is empty, it defaults to id.
+readonly REPO_MANIFEST='
+core-api|Core API (backend)|https://github.com/Teemill/core-api.git|
+frontend|Frontend|https://github.com/Teemill/frontend.git|
+frontend-legacy|Frontend (legacy tree; same remote as frontend)|https://github.com/Teemill/frontend.git|frontend-legacy
+image-api|Image API|https://github.com/Teemill/image-api.git|
+enforcer|Enforcer|https://github.com/Teemill/enforcer.git|
+drive|Drive|https://github.com/Teemill/drive.git|
+file-processor|File processor|https://github.com/Teemill/file-processor.git|
+domain-manager|Domains (domain-manager)|https://github.com/Teemill/domain-manager.git|
+metrics|Metrics|https://github.com/Teemill/metrics.git|
+product-feed|Product feed|https://github.com/Teemill/product-feed.git|
+infrastructure|Infrastructure|https://github.com/Teemill/infrastructure.git|
+'
+
+# Space-separated repo ids chosen when you press Enter at the prompt.
+readonly DEFAULT_SELECTED_IDS="core-api frontend image-api"
+
+usage() {
+  cat <<'EOF'
+Usage: install-repos.sh [options]
+
+  Arrow keys + Space to pick repos (Enter confirms). If there is no TTY, you type
+  numbers instead (see prompt on screen).
+
+Options:
+  --root DIR     Clone destination (default: ~/teemill or $TEEMILL_ROOT)
+  --dry-run      Print git clone commands instead of running them
+  --list         Print known repositories and exit
+  -h, --help     Show this help
+
+Environment:
+  TEEMILL_ROOT   Same as --root when --root is omitted
+
+Dependencies:
+  git, a terminal (for arrow/Space selection)
+EOF
+}
+
+arrow_menu_tty_available() {
+  exec 3<>/dev/tty 2>/dev/null && [[ -t 3 ]] && exec 3<&- && exec 3>&-
+}
+
+is_selected_by_default() {
+  local candidate="$1"
+  local token
+
+  for token in $DEFAULT_SELECTED_IDS; do
+    if [[ "$token" == "$candidate" ]]; then
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+# Reads one logical key from fd 3. Prints a token: UP DOWN ENTER SPACE ESC Q NONE
+# Uses read -N1 (not -n1): Enter sends LF/CR and must be read as data, not as read's line delimiter.
+read_menu_key() {
+  local tty_fd="$1"
+  local first second third
+
+  IFS= read -rsN1 -u "$tty_fd" first || return 1
+
+  if [[ -z "$first" ]]; then
+    printf 'ENTER'
+    return
+  fi
+
+  if [[ "$first" == $'\e' ]]; then
+    if ! IFS= read -rsN1 -t 0.05 -u "$tty_fd" second; then
+      printf 'ESC'
+      return
+    fi
+
+    if [[ "$second" == "[" || "$second" == "O" ]]; then
+      if ! IFS= read -rsN1 -t 0.05 -u "$tty_fd" third; then
+        printf 'NONE'
+        return
+      fi
+
+      if [[ "$second" == "[" ]]; then
+        case "$third" in
+          A) printf 'UP' ;;
+          B) printf 'DOWN' ;;
+          *) printf 'NONE' ;;
+        esac
+
+        return
+      fi
+
+      if [[ "$second" == "O" ]]; then
+        case "$third" in
+          A) printf 'UP' ;;
+          B) printf 'DOWN' ;;
+          *) printf 'NONE' ;;
+        esac
+
+        return
+      fi
+    fi
+
+    printf 'NONE'
+    return
+  fi
+
+  if [[ "$first" == " " ]]; then
+    printf 'SPACE'
+    return
+  fi
+
+  if [[ "$first" == $'\n' || "$first" == $'\r' ]]; then
+    printf 'ENTER'
+    return
+  fi
+
+  if [[ "$first" == "q" || "$first" == "Q" ]]; then
+    printf 'Q'
+    return
+  fi
+
+  printf 'NONE'
+}
+
+# Draws on fd 3; prints selected repo ids to stdout (one per line) on Enter.
+run_repo_arrow_menu() {
+  local teemill_root="$1"
+  shift
+  local -a manifest_lines=("$@")
+  local count="${#manifest_lines[@]}"
+  local tty_fd=3
+  local saved_stty=""
+  local -a selected=()
+  local -a installed=()
+  local -a selectable_pos=()
+  local sel_n=0
+  local sel_ix=0
+  local cursor=-1
+  local index
+
+  if [[ -d "$teemill_root" ]]; then
+    teemill_root="$(cd -- "$teemill_root" && pwd)"
+  fi
+
+  exec 3<>/dev/tty || return 2
+
+  if ! [[ -t 3 ]]; then
+    exec 3<&-
+    exec 3>&-
+
+    return 2
+  fi
+
+  saved_stty="$(stty -g <&3)"
+  local menu_cleaned=0
+
+  cleanup_arrow_menu() {
+    if [[ "$menu_cleaned" -eq 1 ]]; then
+      return 0
+    fi
+
+    menu_cleaned=1
+    printf '\e[?25h' >&3 2>/dev/null || true
+
+    if [[ -n "${saved_stty:-}" ]]; then
+      stty "$saved_stty" <&3 2>/dev/null || true
+    fi
+
+    exec 3<&-
+    exec 3>&-
+  }
+
+  trap 'trap - EXIT; cleanup_arrow_menu; trap - INT; exit 130' INT
+  trap 'cleanup_arrow_menu' EXIT
+
+  stty -echo -icanon min 1 time 0 <&3
+
+  local manifest_line display_id
+
+  for ((index = 0; index < count; index++)); do
+    manifest_line="${manifest_lines[index]}"
+    display_id="$(manifest_field "$manifest_line" 1)"
+
+    if is_manifest_repo_installed "$teemill_root" "$manifest_line"; then
+      installed[index]=1
+      selected[index]=0
+    else
+      installed[index]=0
+      selectable_pos+=("$index")
+
+      if is_selected_by_default "$display_id"; then
+        selected[index]=1
+      else
+        selected[index]=0
+      fi
+    fi
+  done
+
+  sel_n="${#selectable_pos[@]}"
+
+  if [[ "$sel_n" -gt 0 ]]; then
+    sel_ix=0
+    cursor="${selectable_pos[0]}"
+  fi
+
+  # Screen lines before the first repo row (title, blank, hint, blank).
+  local -r menu_screen_header_lines=3
+
+  draw_menu_row() {
+    local row_index="$1"
+    local with_cursor_highlight="$2"
+    local screen_line=$((menu_screen_header_lines + 1 + row_index))
+    local manifest_line display_id description row_mark
+
+    manifest_line="${manifest_lines[row_index]}"
+    display_id="$(manifest_field "$manifest_line" 1)"
+    description="$(manifest_field "$manifest_line" 2)"
+
+    printf '\e[%d;1H\e[K' "$screen_line" >&3
+
+    if [[ "${installed[row_index]:-0}" -eq 1 ]]; then
+      printf '  \e[32m%s  %-18s  %s\e[0m' '[✓]' "$display_id" "$description" >&3
+      return
+    fi
+
+    row_mark="[ ]"
+
+    if [[ "${selected[row_index]:-0}" -eq 1 ]]; then
+      row_mark="[x]"
+    fi
+
+    if [[ "$with_cursor_highlight" -eq 1 ]]; then
+      printf '  \e[7m%s  %-18s  %s\e[0m' "$row_mark" "$display_id" "$description" >&3
+    else
+      printf '  %s  %-18s  %s' "$row_mark" "$display_id" "$description" >&3
+    fi
+  }
+
+  local first_menu_draw=1
+  local old_cursor=0
+  local redraw_key
+
+  while true; do
+    if [[ "$first_menu_draw" -eq 1 ]]; then
+      printf '\e[2J\e[H\e[?25l' >&3
+      echo "Teemill repositories  (clone into: $teemill_root)" >&3
+      echo >&3
+      echo "  ↑/↓ move (repos to clone only)   Space toggle   Enter confirm   q quit" >&3
+
+      for ((index = 0; index < count; index++)); do
+        if [[ "$sel_n" -gt 0 && "$index" -eq "$cursor" ]]; then
+          draw_menu_row "$index" 1
+        else
+          draw_menu_row "$index" 0
+        fi
+      done
+
+      first_menu_draw=0
+    fi
+
+    redraw_key="$(read_menu_key "$tty_fd")"
+    old_cursor="$cursor"
+
+    case "$redraw_key" in
+      UP)
+        if [[ "$sel_n" -eq 0 ]]; then
+          :
+        else
+          sel_ix=$(( (sel_ix - 1 + sel_n) % sel_n ))
+          cursor="${selectable_pos[$sel_ix]}"
+          draw_menu_row "$old_cursor" 0
+          draw_menu_row "$cursor" 1
+        fi
+        ;;
+      DOWN)
+        if [[ "$sel_n" -eq 0 ]]; then
+          :
+        else
+          sel_ix=$(( (sel_ix + 1) % sel_n ))
+          cursor="${selectable_pos[$sel_ix]}"
+          draw_menu_row "$old_cursor" 0
+          draw_menu_row "$cursor" 1
+        fi
+        ;;
+      SPACE)
+        if [[ "$sel_n" -eq 0 ]]; then
+          :
+        elif [[ "${installed[cursor]:-0}" -eq 1 ]]; then
+          :
+        else
+          if [[ "${selected[cursor]:-0}" -eq 1 ]]; then
+            selected[cursor]=0
+          else
+            selected[cursor]=1
+          fi
+
+          draw_menu_row "$cursor" 1
+        fi
+        ;;
+      ENTER)
+        trap - EXIT
+        trap - INT
+        cleanup_arrow_menu
+
+        for ((index = 0; index < count; index++)); do
+          if [[ "${installed[index]:-0}" -eq 1 ]]; then
+            continue
+          fi
+
+          if [[ "${selected[index]:-0}" -eq 1 ]]; then
+            manifest_line="${manifest_lines[index]}"
+            manifest_field "$manifest_line" 1
+          fi
+        done
+
+        return 0
+        ;;
+      ESC | Q)
+        trap - EXIT
+        trap - INT
+        cleanup_arrow_menu
+
+        return 0
+        ;;
+      *)
+        ;;
+    esac
+  done
+}
+
+parse_manifest_lines() {
+  grep -v '^[[:space:]]*$' <<<"$REPO_MANIFEST" | grep -v '^[[:space:]]*#'
+}
+
+manifest_field() {
+  local line="$1"
+  local index="$2"
+  echo "$line" | awk -F'|' -v "idx=$index" '{gsub(/^[ \t]+|[ \t]+$/,"",$idx); print $idx}'
+}
+
+# Clone destination directory for a manifest row (absolute teemill_root recommended).
+manifest_clone_target_path() {
+  local teemill_root="$1"
+  local manifest_line="$2"
+  local id target_dir
+
+  id="$(manifest_field "$manifest_line" 1)"
+  target_dir="$(manifest_field "$manifest_line" 4)"
+  [[ -z "$target_dir" ]] && target_dir="$id"
+  printf '%s/%s' "$teemill_root" "$target_dir"
+}
+
+is_manifest_repo_installed() {
+  local dest_path
+  dest_path="$(manifest_clone_target_path "$1" "$2")"
+  [[ -d "$dest_path/.git" ]]
+}
+
+# Prints one repo id per line to stdout. Uses arrow/Space on /dev/tty when available.
+prompt_repo_ids_cli() {
+  local teemill_root="$1"
+  local -a manifest_lines=()
+  local manifest_line
+
+  while IFS= read -r manifest_line; do
+    [[ -z "$manifest_line" ]] && continue
+    manifest_lines+=("$manifest_line")
+  done < <(parse_manifest_lines)
+
+  if [[ "${#manifest_lines[@]}" -eq 0 ]]; then
+    echo "install-repos.sh: internal error: empty manifest." >&2
+    exit 2
+  fi
+
+  if [[ -d "$teemill_root" ]]; then
+    teemill_root="$(cd -- "$teemill_root" && pwd)"
+  fi
+
+  if arrow_menu_tty_available; then
+    local menu_status=0
+    run_repo_arrow_menu "$teemill_root" "${manifest_lines[@]}" || menu_status=$?
+
+    if [[ "$menu_status" -eq 2 ]]; then
+      prompt_repo_ids_fallback_numbers "$teemill_root" "${manifest_lines[@]}"
+    fi
+
+    return
+  fi
+
+  prompt_repo_ids_fallback_numbers "$teemill_root" "${manifest_lines[@]}"
+}
+
+# Plain line-based prompt when there is no usable TTY for the arrow menu.
+prompt_repo_ids_fallback_numbers() {
+  local teemill_root="$1"
+  shift
+  local -a manifest_lines=("$@")
+  local count="${#manifest_lines[@]}"
+  local index display_id description marker
+  local reply normalized token start end i j
+  local manifest_line
+  local -a row_installed=()
+
+  if [[ -d "$teemill_root" ]]; then
+    teemill_root="$(cd -- "$teemill_root" && pwd)"
+  fi
+
+  for ((index = 0; index < count; index++)); do
+    manifest_line="${manifest_lines[index]}"
+
+    if is_manifest_repo_installed "$teemill_root" "$manifest_line"; then
+      row_installed[index]=1
+    else
+      row_installed[index]=0
+    fi
+  done
+
+  echo "Teemill repos (clone into: $teemill_root)  (no TTY: type numbers instead of arrow keys)" >&2
+  echo >&2
+
+  index=1
+
+  for ((j = 0; j < count; j++)); do
+    manifest_line="${manifest_lines[j]}"
+    display_id="$(manifest_field "$manifest_line" 1)"
+    description="$(manifest_field "$manifest_line" 2)"
+    marker=" "
+
+    if [[ "${row_installed[j]:-0}" -eq 1 ]]; then
+      marker='[✓]'
+      printf '  \e[32m%s  %2d  %-20s  %s\e[0m\n' "$marker" "$index" "$display_id" "$description" >&2
+    else
+      if is_selected_by_default "$display_id"; then
+        marker="*"
+      fi
+
+      printf '  %s  %2d  %-20s  %s\n' "$marker" "$index" "$display_id" "$description" >&2
+    fi
+
+    index=$((index + 1))
+  done
+
+  echo >&2
+  echo "  * = default clone set (only repos not already installed)." >&2
+  echo "  [✓] = already cloned under this path (skipped for defaults, \"all\", and numbers)." >&2
+  echo "  Enter: 1-based numbers (spaces or commas), ranges like 3-5, \"all\", or \"none\"." >&2
+  printf '  Which to clone? [default bundle] ' >&2
+
+  reply=""
+
+  if [[ -r /dev/tty ]]; then
+    read -r reply </dev/tty || true
+  else
+    read -r reply || true
+  fi
+
+  normalized="${reply//,/ }"
+  normalized="${normalized#"${normalized%%[![:space:]]*}"}"
+  normalized="${normalized%"${normalized##*[![:space:]]}"}"
+
+  if [[ -z "$normalized" ]]; then
+    for ((j = 0; j < count; j++)); do
+      manifest_line="${manifest_lines[j]}"
+      display_id="$(manifest_field "$manifest_line" 1)"
+
+      if [[ "${row_installed[j]:-0}" -eq 1 ]]; then
+        continue
+      fi
+
+      if is_selected_by_default "$display_id"; then
+        echo "$display_id"
+      fi
+    done
+
+    return
+  fi
+
+  if [[ "${normalized,,}" == "none" ]]; then
+    return
+  fi
+
+  if [[ "${normalized,,}" == "all" ]]; then
+    for ((j = 0; j < count; j++)); do
+      manifest_line="${manifest_lines[j]}"
+
+      if [[ "${row_installed[j]:-0}" -eq 1 ]]; then
+        continue
+      fi
+
+      manifest_field "$manifest_line" 1
+    done
+
+    return
+  fi
+
+  declare -A picked=()
+
+  for token in $normalized; do
+    if [[ "$token" =~ ^([1-9][0-9]*)-([1-9][0-9]*)$ ]]; then
+      start="${BASH_REMATCH[1]}"
+      end="${BASH_REMATCH[2]}"
+
+      if [[ "$start" -gt "$end" ]]; then
+        local swap="$start"
+        start="$end"
+        end="$swap"
+      fi
+
+      if [[ "$end" -gt "$count" ]] || [[ "$start" -lt 1 ]]; then
+        echo "install-repos.sh: range out of bounds: $token (valid 1-$count)" >&2
+        exit 2
+      fi
+
+      for ((j = start; j <= end; j++)); do
+        picked[$j]=1
+      done
+
+      continue
+    fi
+
+    if [[ "$token" =~ ^[1-9][0-9]*$ ]]; then
+      if [[ "$token" -lt 1 ]] || [[ "$token" -gt "$count" ]]; then
+        echo "install-repos.sh: index out of bounds: $token (valid 1-$count)" >&2
+        exit 2
+      fi
+
+      picked[$token]=1
+      continue
+    fi
+
+    echo "install-repos.sh: could not parse token: $token (use numbers, ranges, all, or none)" >&2
+    exit 2
+  done
+
+  for ((i = 1; i <= count; i++)); do
+    if [[ -n "${picked[$i]:-}" ]]; then
+      if [[ "${row_installed[i - 1]:-0}" -eq 1 ]]; then
+        continue
+      fi
+
+      manifest_line="${manifest_lines[i - 1]}"
+      manifest_field "$manifest_line" 1
+    fi
+  done
+}
+
+main() {
+  local teemill_root="$DEFAULT_TEEMILL_ROOT"
+  local dry_run="false"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --root)
+        teemill_root="${2:-}"
+
+        if [[ -z "$teemill_root" ]]; then
+          echo "install-repos.sh: --root needs a directory argument." >&2
+          exit 2
+        fi
+
+        shift 2
+        ;;
+      --dry-run)
+        dry_run="true"
+        shift
+        ;;
+      --list)
+        echo "Known repositories (id | directory | url):"
+
+        while IFS= read -r manifest_line; do
+          [[ -z "$manifest_line" ]] && continue
+          list_id="$(manifest_field "$manifest_line" 1)"
+          list_url="$(manifest_field "$manifest_line" 3)"
+          list_dir="$(manifest_field "$manifest_line" 4)"
+          [[ -z "$list_dir" ]] && list_dir="$list_id"
+          printf '  %-22s %-22s %s\n' "$list_id" "$list_dir" "$list_url"
+        done < <(parse_manifest_lines)
+
+        exit 0
+        ;;
+      -h | --help)
+        usage
+        exit 0
+        ;;
+      *)
+        echo "install-repos.sh: unknown option: $1" >&2
+        usage >&2
+        exit 2
+        ;;
+    esac
+  done
+
+  if ! command -v git >/dev/null 2>&1; then
+    echo "install-repos.sh: git is required but was not found in PATH." >&2
+    exit 2
+  fi
+
+  mkdir -p "$teemill_root"
+
+  if [[ -d "$teemill_root" ]]; then
+    teemill_root="$(cd -- "$teemill_root" && pwd)"
+  fi
+
+  local -a chosen_ids=()
+  mapfile -t chosen_ids < <(prompt_repo_ids_cli "$teemill_root")
+
+  if [[ "${#chosen_ids[@]}" -eq 0 ]]; then
+    echo "install-repos.sh: nothing selected; exiting." >&2
+    exit 0
+  fi
+
+  local chosen match_line url dest_path
+
+  for chosen in "${chosen_ids[@]}"; do
+    [[ -z "$chosen" ]] && continue
+
+    match_line=""
+
+    while IFS= read -r manifest_line; do
+      id="$(manifest_field "$manifest_line" 1)"
+
+      if [[ "$id" == "$chosen" ]]; then
+        match_line="$manifest_line"
+        break
+      fi
+    done < <(parse_manifest_lines)
+
+    if [[ -z "$match_line" ]]; then
+      echo "install-repos.sh: unknown repo id from selection: $chosen" >&2
+      exit 2
+    fi
+
+    url="$(manifest_field "$match_line" 3)"
+    dest_path="$(manifest_clone_target_path "$teemill_root" "$match_line")"
+
+    if is_manifest_repo_installed "$teemill_root" "$match_line"; then
+      echo "install-repos.sh: skip (already a git repo): $(manifest_clone_target_path "$teemill_root" "$match_line")" >&2
+      continue
+    fi
+
+    if [[ -e "$dest_path" ]]; then
+      echo "install-repos.sh: skip (path exists and is not an empty git clone target): $dest_path" >&2
+      continue
+    fi
+
+    local clone_cmd=(git clone "$url" "$dest_path")
+
+    if [[ "$dry_run" == "true" ]]; then
+      printf '%q ' "${clone_cmd[@]}"
+      echo
+      continue
+    fi
+
+    echo "install-repos.sh: cloning $chosen -> $dest_path" >&2
+    "${clone_cmd[@]}"
+  done
+}
+
+main "$@"
