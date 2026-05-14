@@ -11,10 +11,6 @@
 # and git clone commands instead of mutating the system.
 # gcloud auth login runs when gcloud is on PATH (after toolchain install or if already installed), except
 # --dry-run; git/gh + GitHub SSH + gh login follow when a TTY allows it.
-# On Ubuntu (strict ID=ubuntu from /etc/os-release) with GNOME Shell, optionally resets the dock favorites
-# to default browser + IDE + terminal via gsettings (org.gnome.shell favorite-apps) when those .desktop
-# entries can be resolved (browser from the desktop default, IDE from the first installed cursor.desktop or
-# jetbrains-toolbox.desktop when ide_choice is skip).
 # Interactive repo list: arrow keys move, Space toggles, Enter confirms.
 # Falls back to typing numbers if /dev/tty is not usable.
 #
@@ -32,7 +28,7 @@ readonly DEFAULT_TEEMILL_ROOT="${TEEMILL_ROOT:-$HOME/teemill}"
 
 # -----------------------------------------------------------------------------
 # Layout: helpers → toolchain (_version_ / _upstream_ / _install_ / _setup_) →
-# repos (_version_repo / _upstream_repo / _install_repo / _setup_repo) → Ubuntu GNOME dock → menus → main.
+# repos (_version_repo / _upstream_repo / _install_repo / _setup_repo) → menus → main.
 # -----------------------------------------------------------------------------
 
 # stderr: separate prior output from a major step (blank line + banner).
@@ -1122,249 +1118,6 @@ _setup_repo() {
   fi
 }
 
-
-# True when /etc/os-release declares ID=ubuntu (not derivatives unless ID is exactly ubuntu).
-_teemill_os_release_id_is_ubuntu_strict() {
-  local os_id=""
-
-  [[ -r /etc/os-release ]] || return 1
-  os_id="$(grep -E '^[[:space:]]*ID=' /etc/os-release 2>/dev/null | head -n1 | cut -d= -f2- | tr -d '"' | tr -d "'")"
-  os_id="${os_id#"${os_id%%[![:space:]]*}"}"
-  os_id="${os_id%"${os_id##*[![:space:]]}"}"
-  [[ "$os_id" == "ubuntu" ]]
-}
-
-_teemill_desktop_basename_is_installed() {
-  local base="$1"
-  local candidate_path=""
-
-  for candidate_path in \
-    "/usr/share/applications/${base}" \
-    "${HOME}/.local/share/applications/${base}" \
-    "/var/lib/snapd/desktop/applications/${base}" \
-    "/usr/local/share/applications/${base}"; do
-    if [[ -f "$candidate_path" ]]; then
-      return 0
-    fi
-  done
-
-  return 1
-}
-
-# Prints a gsettings-compatible desktop-id array string, e.g. ['a.desktop', 'b.desktop'].
-_teemill_gvariant_favorite_apps_array() {
-  local out="["
-  local first=1
-  local item=""
-
-  for item in "$@"; do
-    [[ -z "$item" ]] && continue
-
-    if [[ "$first" -eq 1 ]]; then
-      first=0
-    else
-      out+=", "
-    fi
-
-    out+="'${item}'"
-  done
-
-  out+="]"
-  printf '%s' "$out"
-}
-
-_teemill_resolve_default_browser_desktop_basename() {
-  local candidate=""
-  local fallback=""
-
-  if command -v xdg-mime >/dev/null 2>&1; then
-    candidate="$(xdg-mime query default x-scheme-handler/http 2>/dev/null || true)"
-    candidate="${candidate#"${candidate%%[![:space:]]*}"}"
-    candidate="${candidate%"${candidate##*[![:space:]]}"}"
-
-    if [[ -n "$candidate" ]] && _teemill_desktop_basename_is_installed "$candidate"; then
-      printf '%s' "$candidate"
-      return 0
-    fi
-  fi
-
-  if command -v xdg-settings >/dev/null 2>&1; then
-    candidate="$(xdg-settings get default-web-browser 2>/dev/null || true)"
-    candidate="${candidate#"${candidate%%[![:space:]]*}"}"
-    candidate="${candidate%"${candidate##*[![:space:]]}"}"
-
-    if [[ -n "$candidate" ]] && _teemill_desktop_basename_is_installed "$candidate"; then
-      printf '%s' "$candidate"
-      return 0
-    fi
-  fi
-
-  for fallback in firefox.desktop google-chrome.desktop chromium-browser.desktop chromium.desktop; do
-    if _teemill_desktop_basename_is_installed "$fallback"; then
-      printf '%s' "$fallback"
-      return 0
-    fi
-  done
-
-  printf ''
-}
-
-_teemill_resolve_primary_ide_desktop_basename() {
-  local ide_choice="${1:-skip}"
-  local fallback=""
-
-  case "$ide_choice" in
-    cursor)
-      if _teemill_desktop_basename_is_installed "cursor.desktop"; then
-        printf '%s' "cursor.desktop"
-        return 0
-      fi
-
-      echo "warning: cursor.desktop not found; trying other IDE .desktop files for dock." >&2
-      ;;
-    jetbrains-toolbox)
-      if _teemill_desktop_basename_is_installed "jetbrains-toolbox.desktop"; then
-        printf '%s' "jetbrains-toolbox.desktop"
-        return 0
-      fi
-
-      echo "warning: jetbrains-toolbox.desktop not found; trying other IDE .desktop files for dock." >&2
-      ;;
-    skip)
-      echo "note: picking first available IDE .desktop for dock (no IDE install step)." >&2
-      ;;
-    *)
-      echo "warning: unknown IDE id '${ide_choice}'; picking first available IDE .desktop for dock." >&2
-      ;;
-  esac
-
-  for fallback in cursor.desktop jetbrains-toolbox.desktop; do
-    if _teemill_desktop_basename_is_installed "$fallback"; then
-      printf '%s' "$fallback"
-      return 0
-    fi
-  done
-
-  printf ''
-}
-
-_teemill_resolve_terminal_desktop_basename() {
-  local fallback=""
-
-  for fallback in org.gnome.Terminal.desktop gnome-terminal.desktop; do
-    if _teemill_desktop_basename_is_installed "$fallback"; then
-      printf '%s' "$fallback"
-      return 0
-    fi
-  done
-
-  for fallback in konsole.desktop; do
-    if _teemill_desktop_basename_is_installed "$fallback"; then
-      printf '%s' "$fallback"
-      return 0
-    fi
-  done
-
-  printf ''
-}
-
-
-_teemill_ubuntu_gnome_favorites_can_use_gsettings() {
-  command -v gsettings >/dev/null 2>&1 || return 1
-  gsettings get org.gnome.shell favorite-apps >/dev/null 2>&1
-}
-
-# Ubuntu + GNOME Shell only: replace favorite-apps with browser, IDE, terminal when resolvable.
-# ide_choice: cursor | jetbrains-toolbox | skip (skip picks the first installed IDE .desktop for the dock).
-bootstrap_ubuntu_gnome_favorite_apps() {
-  local ide_choice="${1:-skip}"
-  local browser_desktop=""
-  local ide_desktop=""
-  local terminal_desktop=""
-  local gvariant=""
-  local resolved_count=0
-  local -a favorites_list=()
-
-  if ! _teemill_os_release_id_is_ubuntu_strict; then
-    if [[ "${TEEMILL_DEBUG:-}" == "1" ]]; then
-      echo "debug: skipping Ubuntu GNOME favorites (not ID=ubuntu)." >&2
-    fi
-
-    return 0
-  fi
-
-  if ! command -v gsettings >/dev/null 2>&1; then
-    echo "Ubuntu: skipping dock favorites (gsettings not installed). Manual: gsettings set org.gnome.shell favorite-apps \"['firefox.desktop','cursor.desktop','org.gnome.Terminal.desktop']\" (adjust .desktop basenames)." >&2
-
-    return 0
-  fi
-
-  if ! _teemill_ubuntu_gnome_favorites_can_use_gsettings; then
-    echo "Ubuntu: skipping dock favorites (gsettings cannot read org.gnome.shell; need GNOME Shell and a usable session D-Bus). Settings > Ubuntu Desktop > Dock, or: gsettings set org.gnome.shell favorite-apps \"[...]\". Over SSH, export DBUS_SESSION_BUS_ADDRESS from your graphical login, or run this from a terminal on the machine." >&2
-
-    if [[ -z "${DISPLAY:-}" && -z "${WAYLAND_DISPLAY:-}" && -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
-      echo "Ubuntu: DISPLAY, WAYLAND_DISPLAY, and DBUS_SESSION_BUS_ADDRESS are unset." >&2
-    fi
-
-    return 0
-  fi
-
-  _teemill_install_major_step "Ubuntu GNOME: dock favorites"
-  echo "" >&2
-
-  browser_desktop="$(_teemill_resolve_default_browser_desktop_basename)"
-  ide_desktop="$(_teemill_resolve_primary_ide_desktop_basename "$ide_choice")"
-  terminal_desktop="$(_teemill_resolve_terminal_desktop_basename)"
-
-  [[ -n "$browser_desktop" ]] && resolved_count=$((resolved_count + 1))
-  [[ -n "$ide_desktop" ]] && resolved_count=$((resolved_count + 1))
-  [[ -n "$terminal_desktop" ]] && resolved_count=$((resolved_count + 1))
-
-  if [[ -z "$browser_desktop" ]]; then
-    echo "warning: could not resolve default browser .desktop for dock favorites." >&2
-  fi
-
-  if [[ -z "$ide_desktop" ]]; then
-    echo "warning: could not resolve IDE .desktop for dock favorites." >&2
-  fi
-
-  if [[ -z "$terminal_desktop" ]]; then
-    echo "warning: could not resolve terminal .desktop for dock favorites." >&2
-  fi
-
-  if [[ "$resolved_count" -lt 2 ]]; then
-    echo "Ubuntu: not changing dock favorites (need at least two resolved .desktop entries; got ${resolved_count})." >&2
-
-    return 0
-  fi
-
-  if [[ "$resolved_count" -lt 3 ]]; then
-    echo "warning: applying partial dock favorites (${resolved_count}/3 .desktop entries resolved)." >&2
-  fi
-
-  if [[ -n "$browser_desktop" ]]; then
-    favorites_list+=("$browser_desktop")
-  fi
-
-  if [[ -n "$ide_desktop" ]]; then
-    favorites_list+=("$ide_desktop")
-  fi
-
-  if [[ -n "$terminal_desktop" ]]; then
-    favorites_list+=("$terminal_desktop")
-  fi
-
-  gvariant="$(_teemill_gvariant_favorite_apps_array "${favorites_list[@]}")"
-
-  if ! gsettings set org.gnome.shell favorite-apps "$gvariant"; then
-    echo "Ubuntu: gsettings set org.gnome.shell favorite-apps failed; configure the dock manually." >&2
-
-    return 0
-  fi
-
-  echo "Ubuntu GNOME Shell dock favorites set to: ${favorites_list[*]}" >&2
-}
-
 # Creates workspace root, optional toolchain (multi-select), then auth steps.
 # Pass dry_run true to print toolchain package plans without mutating (except mkdir workspace root).
 # selected_tools_line empty skips toolchain install and version summary.
@@ -1518,9 +1271,6 @@ Usage: install [options]
   git_protocol ssh, gh auth login + setup-git when needed, and git user.name / user.email
   from your GitHub login when unset (noreply email).
 
-  On Ubuntu (ID=ubuntu) with GNOME Shell, may reset the dock to default browser + first detected IDE +
-  terminal via gsettings (org.gnome.shell favorite-apps) when those .desktop entries resolve.
-
   Clones use SSH (git@github.com:Teemill/…). The frontend and frontend-legacy ids use
   git clone --filter=blob:none. Ensure GitHub SSH auth works.
 
@@ -1539,7 +1289,6 @@ Options:
 
 Environment:
   TEEMILL_ROOT   Same as --root when --root is omitted
-  TEEMILL_DEBUG  Set to 1 for extra stderr when Ubuntu dock favorites are skipped
 
 Dependencies:
   Debian or Ubuntu with apt-get. sudo when not root (package installs and adding your user to the docker group).
@@ -2387,8 +2136,6 @@ main() {
   if [[ -d "$teemill_root" ]]; then
     teemill_root="$(cd -- "$teemill_root" && pwd)"
   fi
-
-  bootstrap_ubuntu_gnome_favorite_apps "skip"
 
   local -a chosen_ids=()
 
