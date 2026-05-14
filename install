@@ -1,13 +1,83 @@
 #!/usr/bin/env bash
-# Clone selected Teemill GitHub repositories into your teemill workspace.
+#
+# Clone selected Teemill GitHub repositories into ~/teemill (or $TEEMILL_ROOT / --root).
 # Interactive list on your terminal: arrow keys move, Space toggles, Enter confirms.
 # Falls back to typing numbers if /dev/tty is not usable.
+#
+# Remote install (fresh machine; creates ~/teemill and installs git when missing):
+#   curl -fsSL https://raw.githubusercontent.com/<org>/dev-starter-kit/<branch>/install | bash -s --
+# Pass flags after -- e.g.  bash -s -- --list
+#
+# When piping the script into bash, stdin is the script body — all prompts read from /dev/tty.
 
 set -u
 
 trap '' PIPE
 
 readonly DEFAULT_TEEMILL_ROOT="${TEEMILL_ROOT:-$HOME/teemill}"
+
+# Run a package-manager command as root when this script is not already root.
+_pkg_as_root() {
+  if [[ "$(id -u)" -eq 0 ]]; then
+    "$@"
+  elif command -v sudo >/dev/null 2>&1; then
+    sudo "$@"
+  else
+    echo "teemill-install: need root or sudo to install packages (git)." >&2
+    return 1
+  fi
+}
+
+# Install git if it is missing (best-effort for common distros / macOS Homebrew).
+install_git_if_missing() {
+  if command -v git >/dev/null 2>&1; then
+    return 0
+  fi
+
+  echo "teemill-install: git not found; installing..." >&2
+
+  if [[ "$(uname -s)" == "Darwin" ]] && command -v brew >/dev/null 2>&1; then
+    brew install git
+  elif command -v apt-get >/dev/null 2>&1; then
+    export DEBIAN_FRONTEND=noninteractive
+    _pkg_as_root apt-get update -qq
+    _pkg_as_root apt-get install -y -qq git
+  elif command -v dnf >/dev/null 2>&1; then
+    _pkg_as_root dnf install -y git
+  elif command -v yum >/dev/null 2>&1; then
+    _pkg_as_root yum install -y -q git
+  elif command -v zypper >/dev/null 2>&1; then
+    _pkg_as_root zypper --non-interactive install -y git
+  elif command -v pacman >/dev/null 2>&1; then
+    _pkg_as_root pacman -S --noconfirm --needed git
+  elif command -v apk >/dev/null 2>&1; then
+    _pkg_as_root apk add --no-cache git
+  else
+    echo "teemill-install: no supported package manager; install git manually and re-run." >&2
+    return 1
+  fi
+
+  if ! command -v git >/dev/null 2>&1; then
+    echo "teemill-install: git is still not on PATH after install attempt." >&2
+    return 1
+  fi
+
+  return 0
+}
+
+# Creates the workspace directory; installs git when needed (skipped for --help / --list).
+bootstrap_environment() {
+  local workspace_root="$1"
+
+  mkdir -p "$workspace_root" || {
+    echo "teemill-install: could not create directory: $workspace_root" >&2
+    exit 2
+  }
+
+  if ! install_git_if_missing; then
+    exit 2
+  fi
+}
 
 # Repositories offered. Format:
 #   id|description|clone_url|target_directory
@@ -31,10 +101,17 @@ readonly DEFAULT_SELECTED_IDS="core-api frontend image-api"
 
 usage() {
   cat <<'EOF'
-Usage: install-repos.sh [options]
+Usage: install [options]
+  (local file: bash path/to/install   remote: curl ... | bash -s -- [options])
+
+  Clones Teemill repos into ~/teemill (created if missing). On a fresh system, git is
+  installed when possible (apt, dnf, yum, brew, pacman, apk, zypper).
 
   Arrow keys + Space to pick repos (Enter confirms). If there is no TTY, you type
   numbers instead (see prompt on screen).
+
+Remote (curl | bash):
+  curl -fsSL <raw-url-to-this-script> | bash -s -- [options]
 
 Options:
   --root DIR     Clone destination (default: ~/teemill or $TEEMILL_ROOT)
@@ -46,7 +123,7 @@ Environment:
   TEEMILL_ROOT   Same as --root when --root is omitted
 
 Dependencies:
-  git, a terminal (for arrow/Space selection)
+  git (installed automatically when possible), a terminal for arrow/Space selection
 EOF
 }
 
@@ -381,7 +458,7 @@ prompt_repo_ids_cli() {
   done < <(parse_manifest_lines)
 
   if [[ "${#manifest_lines[@]}" -eq 0 ]]; then
-    echo "install-repos.sh: internal error: empty manifest." >&2
+    echo "teemill-install: internal error: empty manifest." >&2
     exit 2
   fi
 
@@ -520,7 +597,7 @@ prompt_repo_ids_fallback_numbers() {
       fi
 
       if [[ "$end" -gt "$count" ]] || [[ "$start" -lt 1 ]]; then
-        echo "install-repos.sh: range out of bounds: $token (valid 1-$count)" >&2
+        echo "teemill-install: range out of bounds: $token (valid 1-$count)" >&2
         exit 2
       fi
 
@@ -533,7 +610,7 @@ prompt_repo_ids_fallback_numbers() {
 
     if [[ "$token" =~ ^[1-9][0-9]*$ ]]; then
       if [[ "$token" -lt 1 ]] || [[ "$token" -gt "$count" ]]; then
-        echo "install-repos.sh: index out of bounds: $token (valid 1-$count)" >&2
+        echo "teemill-install: index out of bounds: $token (valid 1-$count)" >&2
         exit 2
       fi
 
@@ -541,7 +618,7 @@ prompt_repo_ids_fallback_numbers() {
       continue
     fi
 
-    echo "install-repos.sh: could not parse token: $token (use numbers, ranges, all, or none)" >&2
+    echo "teemill-install: could not parse token: $token (use numbers, ranges, all, or none)" >&2
     exit 2
   done
 
@@ -567,7 +644,7 @@ main() {
         teemill_root="${2:-}"
 
         if [[ -z "$teemill_root" ]]; then
-          echo "install-repos.sh: --root needs a directory argument." >&2
+          echo "teemill-install: --root needs a directory argument." >&2
           exit 2
         fi
 
@@ -596,29 +673,29 @@ main() {
         exit 0
         ;;
       *)
-        echo "install-repos.sh: unknown option: $1" >&2
+        echo "teemill-install: unknown option: $1" >&2
         usage >&2
         exit 2
         ;;
     esac
   done
 
-  if ! command -v git >/dev/null 2>&1; then
-    echo "install-repos.sh: git is required but was not found in PATH." >&2
-    exit 2
-  fi
-
-  mkdir -p "$teemill_root"
+  bootstrap_environment "$teemill_root"
 
   if [[ -d "$teemill_root" ]]; then
     teemill_root="$(cd -- "$teemill_root" && pwd)"
+  fi
+
+  if ! command -v git >/dev/null 2>&1; then
+    echo "teemill-install: git is required but was not found in PATH." >&2
+    exit 2
   fi
 
   local -a chosen_ids=()
   mapfile -t chosen_ids < <(prompt_repo_ids_cli "$teemill_root")
 
   if [[ "${#chosen_ids[@]}" -eq 0 ]]; then
-    echo "install-repos.sh: nothing selected; exiting." >&2
+    echo "teemill-install: nothing selected; exiting." >&2
     exit 0
   fi
 
@@ -639,7 +716,7 @@ main() {
     done < <(parse_manifest_lines)
 
     if [[ -z "$match_line" ]]; then
-      echo "install-repos.sh: unknown repo id from selection: $chosen" >&2
+      echo "teemill-install: unknown repo id from selection: $chosen" >&2
       exit 2
     fi
 
@@ -647,12 +724,12 @@ main() {
     dest_path="$(manifest_clone_target_path "$teemill_root" "$match_line")"
 
     if is_manifest_repo_installed "$teemill_root" "$match_line"; then
-      echo "install-repos.sh: skip (already a git repo): $(manifest_clone_target_path "$teemill_root" "$match_line")" >&2
+      echo "teemill-install: skip (already a git repo): $(manifest_clone_target_path "$teemill_root" "$match_line")" >&2
       continue
     fi
 
     if [[ -e "$dest_path" ]]; then
-      echo "install-repos.sh: skip (path exists and is not an empty git clone target): $dest_path" >&2
+      echo "teemill-install: skip (path exists and is not an empty git clone target): $dest_path" >&2
       continue
     fi
 
@@ -664,7 +741,7 @@ main() {
       continue
     fi
 
-    echo "install-repos.sh: cloning $chosen -> $dest_path" >&2
+    echo "teemill-install: cloning $chosen -> $dest_path" >&2
     "${clone_cmd[@]}"
   done
 }
