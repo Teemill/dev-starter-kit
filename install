@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 #
 # Clone selected Teemill GitHub repositories into ~/teemill (or $TEEMILL_ROOT / --root).
-# Interactive list on your terminal: arrow keys move, Space toggles, Enter confirms.
+# Clones use SSH (git@github.com:Teemill/…). Bootstraps git, gh, and gcloud after a version summary
+# and confirmation (or use --yes). Interactive repo list: arrow keys move, Space toggles, Enter confirms.
 # Falls back to typing numbers if /dev/tty is not usable.
 #
-# Remote install (fresh machine; creates ~/teemill and installs git when missing):
-#   curl -fsSL https://raw.githubusercontent.com/<org>/dev-starter-kit/<branch>/install | bash -s --
+# Remote install (fresh machine; creates ~/teemill, then git/gh/gcloud after confirmation):
+#   curl -fsSL https://raw.githubusercontent.com/<org>/dev-starter-kit/<branch>/install | bash -s -- --yes
 # Pass flags after -- e.g.  bash -s -- --list
 #
 # When piping the script into bash, stdin is the script body — all prompts read from /dev/tty.
@@ -23,77 +24,310 @@ _pkg_as_root() {
   elif command -v sudo >/dev/null 2>&1; then
     sudo "$@"
   else
-    echo "teemill-install: need root or sudo to install packages (git)." >&2
+    echo "teemill-install: need root or sudo to install packages." >&2
     return 1
   fi
 }
 
-# Install git if it is missing (best-effort for common distros / macOS Homebrew).
-install_git_if_missing() {
-  if command -v git >/dev/null 2>&1; then
+_installed_version_git() {
+  command -v git >/dev/null 2>&1 || {
+    echo ""
+    return
+  }
+  git --version 2>/dev/null | sed -E 's/.*git version ([0-9][0-9.]*).*/\1/'
+}
+
+_installed_version_gh() {
+  command -v gh >/dev/null 2>&1 || {
+    echo ""
+    return
+  }
+  gh version 2>/dev/null | head -n1 | sed -E 's/^gh version ([0-9][0-9.]*).*/\1/'
+}
+
+_installed_version_gcloud_sdk() {
+  command -v gcloud >/dev/null 2>&1 || {
+    echo ""
+    return
+  }
+  gcloud version 2>/dev/null | sed -n 's/^Google Cloud SDK \([0-9][0-9.]*\).*/\1/p' | head -n1
+}
+
+# Reads GitHub API "tag_name" from a releases/latest JSON response (no jq).
+_json_curl_release_tag_name() {
+  local url="$1"
+  curl -fsSL --connect-timeout 6 --max-time 22 \
+    -H 'Accept: application/vnd.github+json' \
+    -H 'User-Agent: teemill-install' \
+    "$url" 2>/dev/null | grep -m1 -oE '"tag_name"[[:space:]]*:[[:space:]]*"[^"]+"' | sed -E 's/.*"([^"]+)".*/\1/' | sed -E 's/^v//'
+}
+
+_latest_upstream_git_tag() {
+  _json_curl_release_tag_name "https://api.github.com/repos/git/git/releases/latest"
+}
+
+_latest_upstream_gh_tag() {
+  _json_curl_release_tag_name "https://api.github.com/repos/cli/cli/releases/latest"
+}
+
+_latest_upstream_gcloud_version() {
+  curl -fsSL --connect-timeout 6 --max-time 25 \
+    "https://dl.google.com/dl/cloudsdk/channels/rapid/components-2.json" 2>/dev/null \
+    | head -c 196608 | grep -m1 -oE '"version"[[:space:]]*:[[:space:]]*"[0-9][0-9.]*"' | grep -oE '[0-9][0-9.]*' | head -n1
+}
+
+_version_is_strictly_older() {
+  local installed="$1"
+  local latest="$2"
+
+  [[ -z "$latest" ]] && return 1
+  [[ -z "$installed" ]] && return 0
+  [[ "$installed" == "$latest" ]] && return 1
+  local first
+  first="$(printf '%s\n' "$installed" "$latest" | sort -V | head -n1)"
+  [[ "$first" == "$installed" ]]
+}
+
+_confirm_toolchain_install_with_summary() {
+  local assume_yes="$1"
+  local cur_git="$2"
+  local cur_gh="$3"
+  local cur_gc="$4"
+  local lat_git="$5"
+  local lat_gh="$6"
+  local lat_gc="$7"
+
+  echo "" >&2
+  echo "teemill-install: toolchain (git, gh, gcloud) - current vs upstream latest" >&2
+  echo "------------------------------------------------------------------------------" >&2
+  printf '%-8s  %-18s  %-18s  %s\n' "Tool" "Installed" "Upstream latest" "Note" >&2
+  printf '%-8s  %-18s  %-18s  %s\n' "----" "------------------" "------------------" "----" >&2
+  printf '%-8s  %-18s  %-18s  %s\n' "git" "${cur_git:-(none)}" "${lat_git:-(unknown)}" "Package feed / OS" >&2
+  printf '%-8s  %-18s  %-18s  %s\n' "gh" "${cur_gh:-(none)}" "${lat_gh:-(unknown)}" "GitHub CLI releases" >&2
+  printf '%-8s  %-18s  %-18s  %s\n' "gcloud" "${cur_gc:-(none)}" "${lat_gc:-(unknown)}" "Rapid channel manifest" >&2
+  echo "------------------------------------------------------------------------------" >&2
+
+  if [[ -n "$cur_git" && -n "$lat_git" ]] && _version_is_strictly_older "$cur_git" "$lat_git"; then
+    echo "teemill-install: warning: git ${cur_git} is older than upstream release ${lat_git} (distro packages may lag)." >&2
+  fi
+
+  if [[ -n "$cur_gh" && -n "$lat_gh" ]] && _version_is_strictly_older "$cur_gh" "$lat_gh"; then
+    echo "teemill-install: warning: gh ${cur_gh} is older than latest GitHub release ${lat_gh}." >&2
+  fi
+
+  if [[ -n "$cur_gc" && -n "$lat_gc" ]] && _version_is_strictly_older "$cur_gc" "$lat_gc"; then
+    echo "teemill-install: warning: Google Cloud SDK ${cur_gc} is older than rapid channel ${lat_gc}." >&2
+  fi
+
+  echo "" >&2
+  echo "Next step: install or upgrade these tools using apt, Homebrew, dnf, pacman, or apk (where supported)." >&2
+
+  if [[ "$assume_yes" == "true" ]]; then
+    echo "teemill-install: --yes set; proceeding without prompt." >&2
     return 0
   fi
 
-  echo "teemill-install: git not found; installing..." >&2
-
-  if [[ "$(uname -s)" == "Darwin" ]] && command -v brew >/dev/null 2>&1; then
-    brew install git
-  elif command -v apt-get >/dev/null 2>&1; then
-    export DEBIAN_FRONTEND=noninteractive
-    _pkg_as_root apt-get update -qq
-    _pkg_as_root apt-get install -y -qq git
-  elif command -v dnf >/dev/null 2>&1; then
-    _pkg_as_root dnf install -y git
-  elif command -v yum >/dev/null 2>&1; then
-    _pkg_as_root yum install -y -q git
-  elif command -v zypper >/dev/null 2>&1; then
-    _pkg_as_root zypper --non-interactive install -y git
-  elif command -v pacman >/dev/null 2>&1; then
-    _pkg_as_root pacman -S --noconfirm --needed git
-  elif command -v apk >/dev/null 2>&1; then
-    _pkg_as_root apk add --no-cache git
-  else
-    echo "teemill-install: no supported package manager; install git manually and re-run." >&2
+  if [[ ! -r /dev/tty ]] || [[ ! -w /dev/tty ]]; then
+    echo "teemill-install: no interactive terminal for confirmation; re-run with --yes to skip this prompt." >&2
     return 1
   fi
 
-  if ! command -v git >/dev/null 2>&1; then
-    echo "teemill-install: git is still not on PATH after install attempt." >&2
-    return 1
-  fi
+  printf 'Proceed with installing / upgrading? [y/N] ' >&2
+  local reply=""
+  read -r reply </dev/tty || return 1
 
-  return 0
+  case "${reply,,}" in
+    y | yes) return 0 ;;
+    *)
+      echo "teemill-install: aborted before installing tools." >&2
+      return 1
+      ;;
+  esac
 }
 
-# Creates the workspace directory; installs git when needed (skipped for --help / --list).
+_install_toolchain_debian() {
+  export DEBIAN_FRONTEND=noninteractive
+  _pkg_as_root apt-get update -qq
+  _pkg_as_root apt-get install -y -qq ca-certificates curl gnupg dirmngr apt-transport-https
+
+  local google_list=/etc/apt/sources.list.d/google-cloud-sdk.list
+  local google_key=/usr/share/keyrings/google-cloud-teemill.gpg
+
+  if [[ ! -f "$google_list" ]]; then
+    curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | _pkg_as_root gpg --batch --yes --dearmor -o "$google_key"
+    echo "deb [signed-by=${google_key}] https://packages.cloud.google.com/apt cloud-sdk main" | _pkg_as_root tee "$google_list" >/dev/null
+  fi
+
+  local gh_list=/etc/apt/sources.list.d/github-cli.list
+  local gh_key=/usr/share/keyrings/githubcli-archive-keyring.gpg
+
+  if [[ ! -f "$gh_list" ]]; then
+    if ! command -v dpkg >/dev/null 2>&1; then
+      echo "teemill-install: apt-based install requires dpkg (Debian/Ubuntu)." >&2
+      return 1
+    fi
+
+    curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | _pkg_as_root tee "$gh_key" >/dev/null
+    _pkg_as_root chmod go+r "$gh_key" 2>/dev/null || true
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=${gh_key}] https://cli.github.com/packages stable main" | _pkg_as_root tee "$gh_list" >/dev/null
+  fi
+
+  _pkg_as_root apt-get update -qq
+  _pkg_as_root apt-get install -y -qq git gh google-cloud-cli
+}
+
+_install_toolchain_homebrew() {
+  if ! command -v brew >/dev/null 2>&1; then
+    echo "teemill-install: Homebrew not found; install https://brew.sh then re-run." >&2
+    return 1
+  fi
+
+  brew update
+  brew install git gh || brew upgrade git gh
+
+  if command -v gcloud >/dev/null 2>&1; then
+    brew upgrade --cask google-cloud-sdk 2>/dev/null || true
+  else
+    brew install --cask google-cloud-sdk
+  fi
+}
+
+_install_toolchain_dnf() {
+  _pkg_as_root dnf install -y git gh google-cloud-cli
+}
+
+_install_toolchain_pacman() {
+  if _pkg_as_root pacman -S --noconfirm --needed git github-cli google-cloud-cli; then
+    return 0
+  fi
+
+  _pkg_as_root pacman -S --noconfirm --needed git github-cli
+}
+
+_install_toolchain_apk() {
+  if _pkg_as_root apk add --no-cache git github-cli google-cloud-cli; then
+    return 0
+  fi
+
+  _pkg_as_root apk add --no-cache git github-cli
+}
+
+_install_toolchain_yum() {
+  _pkg_as_root yum install -y -q git || true
+
+  if _pkg_as_root yum install -y -q gh google-cloud-cli 2>/dev/null; then
+    return 0
+  fi
+
+  echo "teemill-install: yum: install gh and google-cloud-cli from vendor docs if missing after this step." >&2
+}
+
+_install_toolchain_zypper() {
+  _pkg_as_root zypper --non-interactive install -y git || true
+  _pkg_as_root zypper --non-interactive install -y gh google-cloud-cli 2>/dev/null || true
+}
+
+install_toolchain_for_platform() {
+  if [[ "$(uname -s)" == "Darwin" ]] && command -v brew >/dev/null 2>&1; then
+    _install_toolchain_homebrew
+    return
+  fi
+
+  if command -v apt-get >/dev/null 2>&1; then
+    _install_toolchain_debian
+    return
+  fi
+
+  if command -v dnf >/dev/null 2>&1; then
+    _install_toolchain_dnf
+    return
+  fi
+
+  if command -v yum >/dev/null 2>&1; then
+    _install_toolchain_yum
+    return
+  fi
+
+  if command -v zypper >/dev/null 2>&1; then
+    _install_toolchain_zypper
+    return
+  fi
+
+  if command -v pacman >/dev/null 2>&1; then
+    _install_toolchain_pacman
+    return
+  fi
+
+  if command -v apk >/dev/null 2>&1; then
+    _install_toolchain_apk
+    return
+  fi
+
+  echo "teemill-install: no supported package manager; install git, gh, and gcloud manually." >&2
+  return 1
+}
+
+# Creates ~/teemill (or --root), shows a toolchain plan, prompts, then installs git + gh + gcloud.
+# Second argument is \"true\" to skip the prompt (--yes). Skipped for --help / --list by caller.
 bootstrap_environment() {
   local workspace_root="$1"
+  local assume_yes="${2:-false}"
 
   mkdir -p "$workspace_root" || {
     echo "teemill-install: could not create directory: $workspace_root" >&2
     exit 2
   }
 
-  if ! install_git_if_missing; then
+  local cur_git cur_gh cur_gc lat_git lat_gh lat_gc
+  cur_git="$(_installed_version_git)"
+  cur_gh="$(_installed_version_gh)"
+  cur_gc="$(_installed_version_gcloud_sdk)"
+
+  lat_git="$(_latest_upstream_git_tag)"
+  lat_gh="$(_latest_upstream_gh_tag)"
+  lat_gc="$(_latest_upstream_gcloud_version)"
+
+  if ! _confirm_toolchain_install_with_summary "$assume_yes" "$cur_git" "$cur_gh" "$cur_gc" "$lat_git" "$lat_gh" "$lat_gc"; then
+    exit 1
+  fi
+
+  if ! install_toolchain_for_platform; then
     exit 2
   fi
+
+  if ! command -v git >/dev/null 2>&1; then
+    echo "teemill-install: git is still not on PATH after install attempt." >&2
+    exit 2
+  fi
+
+  if ! command -v gh >/dev/null 2>&1; then
+    echo "teemill-install: gh is still not on PATH after install attempt." >&2
+    exit 2
+  fi
+
+  if ! command -v gcloud >/dev/null 2>&1; then
+    echo "teemill-install: gcloud is still not on PATH after install attempt." >&2
+    exit 2
+  fi
+
+  echo "teemill-install: clones use SSH (git@github.com:Teemill/…). Ensure your GitHub SSH key is loaded." >&2
 }
 
 # Repositories offered. Format:
 #   id|description|clone_url|target_directory
 # If target_directory is empty, it defaults to id.
 readonly REPO_MANIFEST='
-core-api|Core API (backend)|https://github.com/Teemill/core-api.git|
-frontend|Frontend|https://github.com/Teemill/frontend.git|
-frontend-legacy|Frontend (legacy tree; same remote as frontend)|https://github.com/Teemill/frontend.git|frontend-legacy
-image-api|Image API|https://github.com/Teemill/image-api.git|
-enforcer|Enforcer|https://github.com/Teemill/enforcer.git|
-drive|Drive|https://github.com/Teemill/drive.git|
-file-processor|File processor|https://github.com/Teemill/file-processor.git|
-domain-manager|Domains (domain-manager)|https://github.com/Teemill/domain-manager.git|
-metrics|Metrics|https://github.com/Teemill/metrics.git|
-product-feed|Product feed|https://github.com/Teemill/product-feed.git|
-infrastructure|Infrastructure|https://github.com/Teemill/infrastructure.git|
+core-api|Core API (backend)|git@github.com:Teemill/core-api.git|
+frontend|Frontend|git@github.com:Teemill/frontend.git|
+frontend-legacy|Frontend (legacy tree; same remote as frontend)|git@github.com:Teemill/frontend.git|frontend-legacy
+image-api|Image API|git@github.com:Teemill/image-api.git|
+enforcer|Enforcer|git@github.com:Teemill/enforcer.git|
+drive|Drive|git@github.com:Teemill/drive.git|
+file-processor|File processor|git@github.com:Teemill/file-processor.git|
+domain-manager|Domains (domain-manager)|git@github.com:Teemill/domain-manager.git|
+metrics|Metrics|git@github.com:Teemill/metrics.git|
+product-feed|Product feed|git@github.com:Teemill/product-feed.git|
+infrastructure|Infrastructure|git@github.com:Teemill/infrastructure.git|
 '
 
 # Space-separated repo ids chosen when you press Enter at the prompt.
@@ -104,17 +338,21 @@ usage() {
 Usage: install [options]
   (local file: bash path/to/install   remote: curl ... | bash -s -- [options])
 
-  Clones Teemill repos into ~/teemill (created if missing). On a fresh system, git is
-  installed when possible (apt, dnf, yum, brew, pacman, apk, zypper).
+  Clones Teemill repos into ~/teemill (created if missing). Installs or upgrades git,
+  GitHub CLI (gh), and Google Cloud CLI (gcloud) after showing versions and asking for
+  confirmation (use --yes for non-interactive / curl pipes without a TTY).
+
+  Clones use SSH (git@github.com:Teemill/…). Ensure GitHub SSH auth works.
 
   Arrow keys + Space to pick repos (Enter confirms). If there is no TTY, you type
   numbers instead (see prompt on screen).
 
 Remote (curl | bash):
-  curl -fsSL <raw-url-to-this-script> | bash -s -- [options]
+  curl -fsSL <raw-url-to-this-script> | bash -s -- --yes
 
 Options:
   --root DIR     Clone destination (default: ~/teemill or $TEEMILL_ROOT)
+  --yes, -y      Skip the toolchain confirmation prompt (still installs/upgrades tools)
   --dry-run      Print git clone commands instead of running them
   --list         Print known repositories and exit
   -h, --help     Show this help
@@ -123,7 +361,7 @@ Environment:
   TEEMILL_ROOT   Same as --root when --root is omitted
 
 Dependencies:
-  git (installed automatically when possible), a terminal for arrow/Space selection
+  curl (for version checks), sudo on Linux when not root; git, gh, gcloud after bootstrap
 EOF
 }
 
@@ -637,6 +875,7 @@ prompt_repo_ids_fallback_numbers() {
 main() {
   local teemill_root="$DEFAULT_TEEMILL_ROOT"
   local dry_run="false"
+  local assume_yes="false"
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -649,6 +888,10 @@ main() {
         fi
 
         shift 2
+        ;;
+      --yes | -y)
+        assume_yes="true"
+        shift
         ;;
       --dry-run)
         dry_run="true"
@@ -680,15 +923,10 @@ main() {
     esac
   done
 
-  bootstrap_environment "$teemill_root"
+  bootstrap_environment "$teemill_root" "$assume_yes"
 
   if [[ -d "$teemill_root" ]]; then
     teemill_root="$(cd -- "$teemill_root" && pwd)"
-  fi
-
-  if ! command -v git >/dev/null 2>&1; then
-    echo "teemill-install: git is required but was not found in PATH." >&2
-    exit 2
   fi
 
   local -a chosen_ids=()
