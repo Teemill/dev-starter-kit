@@ -34,6 +34,12 @@ readonly DEFAULT_TEEMILL_ROOT="${TEEMILL_ROOT:-$HOME/teemill}"
 # gcloud / git+gh → IDE → Ubuntu GNOME dock → manifests → interactive menus → main.
 # -----------------------------------------------------------------------------
 
+# stderr: separate prior output from a major step (blank line + banner).
+_teemill_install_major_step() {
+  echo "" >&2
+  echo "teemill-install: --- $1 ---" >&2
+}
+
 # Run a package-manager command as root when this script is not already root.
 _pkg_as_root() {
   if [[ "$(id -u)" -eq 0 ]]; then
@@ -225,8 +231,8 @@ _print_selected_toolchain_version_summary() {
   local cur_curl cur_git cur_gh cur_gc cur_docker cur_kubectl cur_helm cur_terraform
   local lat_curl lat_git lat_gh lat_gc lat_kubectl lat_helm lat_terraform
 
+  _teemill_install_major_step "Toolchain: version summary (selected tools)"
   echo "" >&2
-  echo "teemill-install: selected toolchain - current vs upstream latest" >&2
   echo "------------------------------------------------------------------------------" >&2
   printf '%-10s  %-18s  %-18s  %s\n' "Tool" "Installed" "Upstream latest" "Note" >&2
   printf '%-10s  %-18s  %-18s  %s\n' "----------" "------------------" "------------------" "----" >&2
@@ -350,6 +356,7 @@ _dry_run_summarize_homebrew_plan() {
 _print_toolchain_dry_run_package_plan() {
   local selected_line="$1"
 
+  _teemill_install_major_step "Dry-run: toolchain package plan"
   echo "" >&2
   echo "teemill-install: --dry-run: selected toolchain ids: ${selected_line:-<none>}" >&2
 
@@ -1334,6 +1341,8 @@ install_browsers_for_platform() {
 _print_browser_install_dry_run() {
   local browser_id
 
+  _teemill_install_major_step "Dry-run: browser install details"
+  echo "" >&2
   echo "teemill-install: (--dry-run) selected browser ids: $*" >&2
   echo "teemill-install: (--dry-run) install commands / package names for this host:" >&2
 
@@ -1424,8 +1433,8 @@ _run_browser_install_phase() {
   local dry_run="$2"
   local -a chosen_browser_ids=()
 
+  _teemill_install_major_step "Optional browsers: Firefox / Google Chrome"
   echo "" >&2
-  echo "teemill-install: optional desktop browsers (firefox, chrome)" >&2
 
   mapfile -t chosen_browser_ids < <(prompt_browser_ids_cli "$assume_yes")
 
@@ -1447,8 +1456,8 @@ _run_browser_install_phase() {
 _run_gcloud_auth_login_step() {
   local active_account
 
+  _teemill_install_major_step "Google Cloud: gcloud auth login"
   echo "" >&2
-  echo "teemill-install: Google Cloud authentication" >&2
 
   active_account="$(gcloud auth list --filter=status:ACTIVE --format='value(account)' 2>/dev/null | head -n1)"
 
@@ -1490,8 +1499,8 @@ _configure_git_gh_ssh_and_auth_step() {
   local api_login=""
   local uname_s=""
 
+  _teemill_install_major_step "Git, GitHub SSH, and gh authentication"
   echo "" >&2
-  echo "teemill-install: Git, GitHub SSH, and gh authentication" >&2
 
   if ! mkdir -p "$ssh_dir"; then
     echo "teemill-install: could not create $ssh_dir" >&2
@@ -1854,11 +1863,10 @@ prompt_teemill_primary_ide() {
     return 0
   fi
 
+  _teemill_install_major_step "Primary IDE: status and choice"
   echo "" >&2
-  echo "teemill-install: detected IDE status (best effort)" >&2
   _teemill_print_ide_status_for_prompt
   echo "" >&2
-  echo "teemill-install: primary IDE (install + Ubuntu dock); pick one" >&2
   printf '  1) Cursor  2) JetBrains Toolbox  3) Skip  [1] ' >&2
   read -r reply </dev/tty || reply=""
 
@@ -2311,8 +2319,8 @@ _print_primary_ide_install_dry_run() {
   local choice="$1"
   local platform=""
 
+  _teemill_install_major_step "Dry-run: primary IDE install plan (choice: ${choice})"
   echo "" >&2
-  echo "teemill-install: (--dry-run) primary IDE install plan (choice: ${choice})" >&2
 
   case "$choice" in
     skip)
@@ -2433,6 +2441,8 @@ _run_teemill_ide_prompt_and_install_phase() {
     return 0
   fi
 
+  echo "" >&2
+
   case "${TEEMILL_PRIMARY_IDE_CHOICE}" in
     cursor)
       echo "teemill-install: installing Cursor (best-effort; failures are warnings only)." >&2
@@ -2491,6 +2501,9 @@ bootstrap_ubuntu_gnome_favorite_apps() {
 
     return 0
   fi
+
+  _teemill_install_major_step "Ubuntu GNOME: dock favorites"
+  echo "" >&2
 
   browser_desktop="$(_teemill_resolve_default_browser_desktop_basename)"
   ide_desktop="$(_teemill_resolve_primary_ide_desktop_basename "$ide_choice")"
@@ -2560,6 +2573,7 @@ bootstrap_environment() {
   }
 
   if [[ -z "${selected_tools_line// }" ]]; then
+    _teemill_install_major_step "Toolchain: skipped (nothing selected)"
     echo "" >&2
     echo "teemill-install: no toolchain packages selected; skipping toolchain install and version summary." >&2
 
@@ -2569,6 +2583,8 @@ bootstrap_environment() {
 
     _configure_git_gh_ssh_and_auth_step
 
+    _teemill_install_major_step "Next: clone Teemill repositories over SSH"
+    echo "" >&2
     echo "teemill-install: clones use SSH (git@github.com:Teemill/…). Ensure your GitHub SSH key is loaded." >&2
 
     return 0
@@ -2585,10 +2601,15 @@ bootstrap_environment() {
 
     _configure_git_gh_ssh_and_auth_step
 
+    _teemill_install_major_step "Next: clone Teemill repositories over SSH"
+    echo "" >&2
     echo "teemill-install: clones use SSH (git@github.com:Teemill/…). Ensure your GitHub SSH key is loaded." >&2
 
     return 0
   fi
+
+  _teemill_install_major_step "Toolchain: installing packages"
+  echo "" >&2
 
   if ! install_toolchain_for_platform "$selected_tools_line"; then
     exit 2
@@ -2644,6 +2665,8 @@ bootstrap_environment() {
 
   _configure_git_gh_ssh_and_auth_step
 
+  _teemill_install_major_step "Next: clone Teemill repositories over SSH"
+  echo "" >&2
   echo "teemill-install: clones use SSH (git@github.com:Teemill/…). Ensure your GitHub SSH key is loaded." >&2
 }
 
@@ -2868,6 +2891,8 @@ run_toggle_arrow_menu() {
   local saved_stty=""
   local -a selected=()
   local -a installed=()
+  local -a version_installed_col=()
+  local -a version_target_col=()
   local -a selectable_pos=()
   local sel_n=0
   local sel_ix=0
@@ -2932,6 +2957,29 @@ run_toggle_arrow_menu() {
     fi
   done
 
+  if [[ -n "${TEEMILL_TOGGLE_VERSION_INSTALLED_FN:-}" || -n "${TEEMILL_TOGGLE_VERSION_TARGET_FN:-}" ]]; then
+    local vi vt
+
+    for ((index = 0; index < count; index++)); do
+      manifest_line="${manifest_lines[index]}"
+      vi="-"
+      vt="-"
+
+      if [[ -n "${TEEMILL_TOGGLE_VERSION_INSTALLED_FN:-}" ]]; then
+        vi="$("$TEEMILL_TOGGLE_VERSION_INSTALLED_FN" "$root_for_installed" "$manifest_line")"
+        [[ -z "${vi// }" ]] && vi="-"
+      fi
+
+      if [[ -n "${TEEMILL_TOGGLE_VERSION_TARGET_FN:-}" ]]; then
+        vt="$("$TEEMILL_TOGGLE_VERSION_TARGET_FN" "$root_for_installed" "$manifest_line")"
+        [[ -z "${vt// }" ]] && vt="-"
+      fi
+
+      version_installed_col[index]="${vi:0:14}"
+      version_target_col[index]="${vt:0:14}"
+    done
+  fi
+
   sel_n="${#selectable_pos[@]}"
 
   if [[ "$sel_n" -gt 0 ]]; then
@@ -2954,18 +3002,10 @@ run_toggle_arrow_menu() {
     display_id="$(manifest_field "$manifest_line" 1)"
     description="$(manifest_field "$manifest_line" 2)"
 
-    if [[ -n "${TEEMILL_TOGGLE_VERSION_INSTALLED_FN:-}" ]]; then
-      vi="$("$TEEMILL_TOGGLE_VERSION_INSTALLED_FN" "$root_for_installed" "$manifest_line")"
-      [[ -z "${vi// }" ]] && vi="-"
+    if [[ -n "${TEEMILL_TOGGLE_VERSION_INSTALLED_FN:-}" || -n "${TEEMILL_TOGGLE_VERSION_TARGET_FN:-}" ]]; then
+      vi="${version_installed_col[row_index]:--}"
+      vt="${version_target_col[row_index]:--}"
     fi
-
-    if [[ -n "${TEEMILL_TOGGLE_VERSION_TARGET_FN:-}" ]]; then
-      vt="$("$TEEMILL_TOGGLE_VERSION_TARGET_FN" "$root_for_installed" "$manifest_line")"
-      [[ -z "${vt// }" ]] && vt="-"
-    fi
-
-    vi="${vi:0:14}"
-    vt="${vt:0:14}"
 
     printf '\e[%d;1H\e[K' "$screen_line" >&3
 
@@ -3257,6 +3297,8 @@ prompt_toggle_ids_fallback_numbers() {
     fi
   done
 
+  _teemill_install_major_step "Numbered multi-select (no arrow-menu TTY)"
+  echo "" >&2
   printf '%s\n' "$title_line" >&2
   echo >&2
 
@@ -3632,11 +3674,18 @@ main() {
   TEEMILL_PRIMARY_IDE_CHOICE="skip"
 
   if [[ "$assume_yes" == "true" ]]; then
+    _teemill_install_major_step "Toolchain: defaults (--yes)"
+    echo "" >&2
     selected_tools_line="$DEFAULT_SELECTED_TOOL_IDS"
   else
+    _teemill_install_major_step "Toolchain: interactive selection"
+    echo "" >&2
     mapfile -t selected_tool_ids_array < <(prompt_tool_ids_cli)
     selected_tools_line="${selected_tool_ids_array[*]}"
   fi
+
+  _teemill_install_major_step "Bootstrap: workspace, toolchain, IDE, browsers, auth"
+  echo "" >&2
 
   bootstrap_environment "$teemill_root" "$assume_yes" "$dry_run" "$selected_tools_line"
 
@@ -3647,6 +3696,9 @@ main() {
   bootstrap_ubuntu_gnome_favorite_apps "${TEEMILL_PRIMARY_IDE_CHOICE:-skip}"
 
   local -a chosen_ids=()
+
+  _teemill_install_major_step "Teemill repositories: selection and clones"
+  echo "" >&2
 
   if [[ "$assume_yes" == "true" ]]; then
     mapfile -t chosen_ids < <(emit_default_repo_ids_for_teemill_root "$teemill_root")
