@@ -5,7 +5,7 @@
 # git clone --filter=blob:none to keep the initial download small. Toolchain is a multi-select step (same UX as repos: arrows,
 # Space toggles, Enter confirms; numbered fallback): defaults on for curl, git, gh, gcloud, docker;
 # kubectl, helm, and terraform are optional (off by default). Shows a version summary for selected tools,
-# then installs (Linux: distro Docker packages + docker group for passwordless CLI; macOS: Homebrew when available).
+# then installs toolchain packages with apt (Debian/Ubuntu only; docker.io + docker group for passwordless CLI).
 # --yes skips prompts and uses
 # default toolchain ids plus default repo clone set. --dry-run prints resolved toolchain package names
 # and git clone commands instead of mutating the system.
@@ -31,14 +31,14 @@ trap '' PIPE
 readonly DEFAULT_TEEMILL_ROOT="${TEEMILL_ROOT:-$HOME/teemill}"
 
 # -----------------------------------------------------------------------------
-# Layout: shared helpers → toolchain (versions, dry-run, installers) →
-# gcloud / git+gh → Ubuntu GNOME dock → manifests → interactive menus → main.
+# Layout: helpers → toolchain (_version_ / _upstream_ / _install_ / _setup_) →
+# repos (_version_repo / _upstream_repo / _install_repo / _setup_repo) → Ubuntu GNOME dock → menus → main.
 # -----------------------------------------------------------------------------
 
 # stderr: separate prior output from a major step (blank line + banner).
 _teemill_install_major_step() {
   echo "" >&2
-  echo "teemill-install: --- $1 ---" >&2
+  echo "--- $1 ---" >&2
 }
 
 # Run a package-manager command as root when this script is not already root.
@@ -48,7 +48,7 @@ _pkg_as_root() {
   elif command -v sudo >/dev/null 2>&1; then
     sudo "$@"
   else
-    echo "teemill-install: need root or sudo to install packages." >&2
+    echo "need root or sudo to install packages." >&2
     return 1
   fi
 }
@@ -77,7 +77,7 @@ _http_get_github_json_body() {
   if command -v curl >/dev/null 2>&1; then
     curl -fsSL --connect-timeout 6 --max-time 22 \
       -H 'Accept: application/vnd.github+json' \
-      -H 'User-Agent: teemill-install' \
+      -H 'User-Agent: TeemillDevStarterKit/1' \
       "$url" 2>/dev/null || true
 
     return 0
@@ -88,7 +88,103 @@ _http_get_github_json_body() {
   fi
 }
 
-_installed_version_curl() {
+# Stable install / setup order for toolchain ids (matches TOOL_MANIFEST).
+readonly TEEMILL_TOOL_IDS_ORDER="curl git gh gcloud docker kubectl helm terraform"
+
+# Set for the duration of bootstrap post-install (e.g. docker group membership).
+TEEMILL_BOOTSTRAP_SELECTED_TOOLS=""
+
+# Hyphenated manifest ids (e.g. core-api) become core_api for function names.
+_teemill_ident_safe() {
+  printf '%s' "${1//-/_}"
+}
+
+_teemill_declare_fn() {
+  declare -f "${1:?}" >/dev/null 2>&1
+}
+
+# stdout: installed version string or empty.
+_teemill_invoke_version_stdout() {
+  local id="${1:?}"
+  local fn="_version_${id}"
+
+  if ! _teemill_declare_fn "$fn"; then
+    echo ""
+    return
+  fi
+
+  "$fn"
+}
+
+# stdout: upstream / target label for menus (may be empty).
+_teemill_invoke_upstream_stdout() {
+  local id="${1:?}"
+  local fn="_upstream_${id}"
+
+  if ! _teemill_declare_fn "$fn"; then
+    echo ""
+    return
+  fi
+
+  "$fn"
+}
+
+# Debian only: apt update, optional Google + GitHub CLI apt repos when gcloud/gh are selected.
+_teemill_prepare_debian_apt_for_selected() {
+  local want="${1:?}"
+
+  export DEBIAN_FRONTEND=noninteractive
+
+  local need_google_repo=0
+  local need_gh_repo=0
+
+  _selected_line_contains_tool_id "$want" "gcloud" && need_google_repo=1
+  _selected_line_contains_tool_id "$want" "gh" && need_gh_repo=1
+
+  _pkg_as_root apt-get update -qq
+
+  if [[ "$need_google_repo" -eq 1 || "$need_gh_repo" -eq 1 ]]; then
+    _pkg_as_root apt-get install -y -qq ca-certificates curl gnupg dirmngr apt-transport-https || return 1
+  else
+    _pkg_as_root apt-get install -y -qq ca-certificates || true
+  fi
+
+  local google_list=/etc/apt/sources.list.d/google-cloud-sdk.list
+  local google_key=/usr/share/keyrings/google-cloud-teemill.gpg
+
+  if [[ "$need_google_repo" -eq 1 ]]; then
+    if [[ ! -f "$google_list" ]]; then
+      curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | _pkg_as_root gpg --batch --yes --dearmor -o "$google_key"
+      echo "deb [signed-by=${google_key}] https://packages.cloud.google.com/apt cloud-sdk main" | _pkg_as_root tee "$google_list" >/dev/null
+    fi
+  fi
+
+  local gh_list=/etc/apt/sources.list.d/github-cli.list
+  local gh_key=/usr/share/keyrings/githubcli-archive-keyring.gpg
+
+  if [[ "$need_gh_repo" -eq 1 ]]; then
+    if [[ ! -f "$gh_list" ]]; then
+      if ! command -v dpkg >/dev/null 2>&1; then
+        echo "apt-based install requires dpkg (Debian/Ubuntu)." >&2
+        return 1
+      fi
+
+      curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | _pkg_as_root tee "$gh_key" >/dev/null
+      _pkg_as_root chmod go+r "$gh_key" 2>/dev/null || true
+      echo "deb [arch=$(dpkg --print-architecture) signed-by=${gh_key}] https://cli.github.com/packages stable main" | _pkg_as_root tee "$gh_list" >/dev/null
+    fi
+  fi
+
+  if [[ "$need_google_repo" -eq 1 || "$need_gh_repo" -eq 1 ]]; then
+    _pkg_as_root apt-get update -qq
+  fi
+
+  return 0
+}
+
+# --- Toolchain: _version_* (stdout = installed version or empty) ---
+
+_version_curl() {
   command -v curl >/dev/null 2>&1 || {
     echo ""
     return
@@ -96,7 +192,7 @@ _installed_version_curl() {
   curl --version 2>/dev/null | head -n1 | sed -E 's/^curl ([0-9][0-9.]*).*/\1/'
 }
 
-_installed_version_git() {
+_version_git() {
   command -v git >/dev/null 2>&1 || {
     echo ""
     return
@@ -104,7 +200,7 @@ _installed_version_git() {
   git --version 2>/dev/null | sed -E 's/.*git version ([0-9][0-9.]*).*/\1/'
 }
 
-_installed_version_gh() {
+_version_gh() {
   command -v gh >/dev/null 2>&1 || {
     echo ""
     return
@@ -112,7 +208,7 @@ _installed_version_gh() {
   gh version 2>/dev/null | head -n1 | sed -E 's/^gh version ([0-9][0-9.]*).*/\1/'
 }
 
-_installed_version_gcloud_sdk() {
+_version_gcloud() {
   command -v gcloud >/dev/null 2>&1 || {
     echo ""
     return
@@ -120,7 +216,7 @@ _installed_version_gcloud_sdk() {
   gcloud version 2>/dev/null | sed -n 's/^Google Cloud SDK \([0-9][0-9.]*\).*/\1/p' | head -n1
 }
 
-_installed_version_docker() {
+_version_docker() {
   command -v docker >/dev/null 2>&1 || {
     echo ""
     return
@@ -128,7 +224,7 @@ _installed_version_docker() {
   docker --version 2>/dev/null | sed -E 's/.*version ([0-9][0-9.]*).*/\1/' | head -n1
 }
 
-_installed_version_kubectl() {
+_version_kubectl() {
   command -v kubectl >/dev/null 2>&1 || {
     echo ""
     return
@@ -136,7 +232,7 @@ _installed_version_kubectl() {
   kubectl version --client=true -o json 2>/dev/null | grep -m1 -oE '"gitVersion"[[:space:]]*:[[:space:]]*"v[^"]+"' | grep -oE 'v[0-9][^"]*' | sed 's/^v//' | head -n1
 }
 
-_installed_version_helm() {
+_version_helm() {
   command -v helm >/dev/null 2>&1 || {
     echo ""
     return
@@ -144,12 +240,44 @@ _installed_version_helm() {
   helm version --short 2>/dev/null | sed -E 's/^v([0-9][0-9.]*).*/\1/' | head -n1
 }
 
-_installed_version_terraform() {
+_version_terraform() {
   command -v terraform >/dev/null 2>&1 || {
     echo ""
     return
   }
   terraform version -json 2>/dev/null | grep -m1 -oE '"terraform_version"[[:space:]]*:[[:space:]]*"[^"]+"' | grep -oE '[0-9][0-9.]*' | head -n1
+}
+
+_upstream_curl() {
+  _latest_upstream_curl_tag
+}
+
+_upstream_git() {
+  _latest_upstream_git_tag
+}
+
+_upstream_gh() {
+  _latest_upstream_gh_tag
+}
+
+_upstream_gcloud() {
+  _latest_upstream_gcloud_version
+}
+
+_upstream_docker() {
+  printf 'distro'
+}
+
+_upstream_kubectl() {
+  _latest_upstream_kubectl_version
+}
+
+_upstream_helm() {
+  _latest_upstream_helm_tag
+}
+
+_upstream_terraform() {
+  _latest_upstream_terraform_tag
 }
 
 # Reads GitHub API "tag_name" from a releases/latest JSON response (no jq).
@@ -238,14 +366,14 @@ _print_selected_toolchain_version_summary() {
   printf '%-10s  %-18s  %-18s  %s\n' "Tool" "Installed" "Upstream latest" "Note" >&2
   printf '%-10s  %-18s  %-18s  %s\n' "----------" "------------------" "------------------" "----" >&2
 
-  cur_curl="$(_installed_version_curl)"
-  cur_git="$(_installed_version_git)"
-  cur_gh="$(_installed_version_gh)"
-  cur_gc="$(_installed_version_gcloud_sdk)"
-  cur_docker="$(_installed_version_docker)"
-  cur_kubectl="$(_installed_version_kubectl)"
-  cur_helm="$(_installed_version_helm)"
-  cur_terraform="$(_installed_version_terraform)"
+  cur_curl="$(_teemill_invoke_version_stdout curl)"
+  cur_git="$(_teemill_invoke_version_stdout git)"
+  cur_gh="$(_teemill_invoke_version_stdout gh)"
+  cur_gc="$(_teemill_invoke_version_stdout gcloud)"
+  cur_docker="$(_teemill_invoke_version_stdout docker)"
+  cur_kubectl="$(_teemill_invoke_version_stdout kubectl)"
+  cur_helm="$(_teemill_invoke_version_stdout helm)"
+  cur_terraform="$(_teemill_invoke_version_stdout terraform)"
 
   lat_curl="$(_latest_upstream_curl_tag)"
   lat_git="$(_latest_upstream_git_tag)"
@@ -291,67 +419,34 @@ _print_selected_toolchain_version_summary() {
 
   if _selected_line_contains_tool_id "$selected_line" "curl"; then
     if [[ -n "$cur_curl" && -n "$lat_curl" ]] && _version_is_strictly_older "$cur_curl" "$lat_curl"; then
-      echo "teemill-install: warning: curl ${cur_curl} is older than latest upstream release ${lat_curl} (distro packages may lag)." >&2
+      echo "warning: curl ${cur_curl} is older than latest upstream release ${lat_curl} (distro packages may lag)." >&2
     fi
   fi
 
   if _selected_line_contains_tool_id "$selected_line" "git"; then
     if [[ -n "$cur_git" && -n "$lat_git" ]] && _version_is_strictly_older "$cur_git" "$lat_git"; then
-      echo "teemill-install: warning: git ${cur_git} is older than upstream release ${lat_git} (distro packages may lag)." >&2
+      echo "warning: git ${cur_git} is older than upstream release ${lat_git} (distro packages may lag)." >&2
     fi
   fi
 
   if _selected_line_contains_tool_id "$selected_line" "gh"; then
     if [[ -n "$cur_gh" && -n "$lat_gh" ]] && _version_is_strictly_older "$cur_gh" "$lat_gh"; then
-      echo "teemill-install: warning: gh ${cur_gh} is older than latest GitHub release ${lat_gh}." >&2
+      echo "warning: gh ${cur_gh} is older than latest GitHub release ${lat_gh}." >&2
     fi
   fi
 
   if _selected_line_contains_tool_id "$selected_line" "gcloud"; then
     if [[ -n "$cur_gc" && -n "$lat_gc" ]] && _version_is_strictly_older "$cur_gc" "$lat_gc"; then
-      echo "teemill-install: warning: Google Cloud SDK ${cur_gc} is older than rapid channel ${lat_gc}." >&2
+      echo "warning: Google Cloud SDK ${cur_gc} is older than rapid channel ${lat_gc}." >&2
     fi
   fi
 
   echo "" >&2
-  echo "Next step: install or upgrade selected tools using apt, Homebrew, dnf, pacman, apk, yum, or zypper (where supported)." >&2
+  echo "Next step: install or upgrade selected tools with apt (Debian/Ubuntu)." >&2
 
   if [[ "$assume_yes" == "true" ]]; then
-    echo "teemill-install: --yes set; proceeding without further toolchain prompts." >&2
+    echo "--yes set; proceeding without further toolchain prompts." >&2
   fi
-}
-
-_dry_run_summarize_homebrew_plan() {
-  local want="$1"
-  local -a formulas=()
-  local -a parts=()
-
-  _selected_line_contains_tool_id "$want" "curl" && formulas+=(curl)
-  _selected_line_contains_tool_id "$want" "git" && formulas+=(git)
-  _selected_line_contains_tool_id "$want" "gh" && formulas+=(gh)
-  _selected_line_contains_tool_id "$want" "kubectl" && formulas+=(kubectl)
-  _selected_line_contains_tool_id "$want" "helm" && formulas+=(helm)
-  _selected_line_contains_tool_id "$want" "terraform" && formulas+=(terraform)
-
-  if [[ "${#formulas[@]}" -gt 0 ]]; then
-    parts+=("brew install ${formulas[*]}")
-  fi
-
-  if _selected_line_contains_tool_id "$want" "gcloud"; then
-    parts+=("brew install --cask google-cloud-sdk")
-  fi
-
-  if _selected_line_contains_tool_id "$want" "docker"; then
-    parts+=("brew install docker")
-  fi
-
-  if [[ "${#parts[@]}" -eq 0 ]]; then
-    echo "(no Homebrew formulas/casks for this selection)"
-
-    return
-  fi
-
-  (IFS='; '; echo "${parts[*]}")
 }
 
 _print_toolchain_dry_run_package_plan() {
@@ -359,88 +454,33 @@ _print_toolchain_dry_run_package_plan() {
 
   _teemill_install_major_step "Dry-run: toolchain package plan"
   echo "" >&2
-  echo "teemill-install: --dry-run: selected toolchain ids: ${selected_line:-<none>}" >&2
+  echo "--dry-run: selected toolchain ids: ${selected_line:-<none>}" >&2
 
   if [[ -z "${selected_line// }" ]]; then
-    echo "teemill-install: --dry-run: no toolchain packages selected; skipping package plan." >&2
+    echo "--dry-run: no toolchain packages selected; skipping package plan." >&2
 
     return 0
   fi
 
-  if [[ "$(uname -s)" == "Darwin" ]] && command -v brew >/dev/null 2>&1; then
-    echo "teemill-install: --dry-run: Homebrew: $(_dry_run_summarize_homebrew_plan "$selected_line")" >&2
-
+  if ! command -v apt-get >/dev/null 2>&1; then
+    echo "--dry-run: apt-get not found (Debian/Ubuntu only)." >&2
     return 0
   fi
 
-  if command -v apt-get >/dev/null 2>&1; then
-    echo "teemill-install: --dry-run: apt packages (best-effort names): $(_dry_run_resolve_toolchain_packages_for_pm_family debian "$selected_line")" >&2
-
-    return 0
-  fi
-
-  if command -v dnf >/dev/null 2>&1; then
-    echo "teemill-install: --dry-run: dnf packages (best-effort names): $(_dry_run_resolve_toolchain_packages_for_pm_family dnf "$selected_line")" >&2
-
-    return 0
-  fi
-
-  if command -v yum >/dev/null 2>&1; then
-    echo "teemill-install: --dry-run: yum packages (best-effort names): $(_dry_run_resolve_toolchain_packages_for_pm_family yum "$selected_line")" >&2
-
-    return 0
-  fi
-
-  if command -v zypper >/dev/null 2>&1; then
-    echo "teemill-install: --dry-run: zypper packages (best-effort names): $(_dry_run_resolve_toolchain_packages_for_pm_family yum "$selected_line")" >&2
-
-    return 0
-  fi
-
-  if command -v pacman >/dev/null 2>&1; then
-    echo "teemill-install: --dry-run: pacman packages (best-effort names): $(_dry_run_resolve_toolchain_packages_for_pm_family pacman "$selected_line")" >&2
-
-    return 0
-  fi
-
-  if command -v apk >/dev/null 2>&1; then
-    echo "teemill-install: --dry-run: apk packages (best-effort names): $(_dry_run_resolve_toolchain_packages_for_pm_family apk "$selected_line")" >&2
-
-    return 0
-  fi
-
-  echo "teemill-install: --dry-run: unknown package manager; cannot list resolved package names." >&2
+  echo "--dry-run: apt packages (best-effort names): $(_dry_run_resolve_toolchain_apt_packages "$selected_line")" >&2
 }
 
-# family: debian | dnf | yum | pacman | apk  (zypper reuses the yum name set in dry-run output)
-_dry_run_resolve_toolchain_packages_for_pm_family() {
-  local family="${1:?}"
-  local want="${2:?}"
+# Resolves apt package names for the selected toolchain ids (dry-run / messaging).
+_dry_run_resolve_toolchain_apt_packages() {
+  local want="${1:?}"
   local -a names=()
 
   _selected_line_contains_tool_id "$want" "curl" && names+=(curl)
   _selected_line_contains_tool_id "$want" "git" && names+=(git)
-
-  if [[ "$family" == "pacman" || "$family" == "apk" ]]; then
-    _selected_line_contains_tool_id "$want" "gh" && names+=(github-cli)
-  else
-    _selected_line_contains_tool_id "$want" "gh" && names+=(gh)
-  fi
-
+  _selected_line_contains_tool_id "$want" "gh" && names+=(gh)
   _selected_line_contains_tool_id "$want" "gcloud" && names+=(google-cloud-cli)
-
-  if [[ "$family" == "debian" ]]; then
-    _selected_line_contains_tool_id "$want" "docker" && names+=(docker.io)
-  else
-    _selected_line_contains_tool_id "$want" "docker" && names+=(docker)
-  fi
-
-  if [[ "$family" == "dnf" ]]; then
-    _selected_line_contains_tool_id "$want" "kubectl" && names+=("kubectl|kubernetes-client")
-  else
-    _selected_line_contains_tool_id "$want" "kubectl" && names+=(kubectl)
-  fi
-
+  _selected_line_contains_tool_id "$want" "docker" && names+=(docker.io)
+  _selected_line_contains_tool_id "$want" "kubectl" && names+=(kubectl)
   _selected_line_contains_tool_id "$want" "helm" && names+=(helm)
   _selected_line_contains_tool_id "$want" "terraform" && names+=(terraform)
 
@@ -453,315 +493,286 @@ _debian_apt_cache_has_package() {
   apt-cache show "$candidate" >/dev/null 2>&1
 }
 
-_install_toolchain_debian() {
-  local want="$1"
+# --- Toolchain: _install_* (apt / Debian-Ubuntu only) ---
 
-  export DEBIAN_FRONTEND=noninteractive
+_install_curl() {
+  _pkg_as_root apt-get install -y -qq curl
+}
 
-  local need_google_repo=0
-  local need_gh_repo=0
+_install_git() {
+  _pkg_as_root apt-get install -y -qq git
+}
 
-  _selected_line_contains_tool_id "$want" "gcloud" && need_google_repo=1
-  _selected_line_contains_tool_id "$want" "gh" && need_gh_repo=1
+_install_gh() {
+  _pkg_as_root apt-get install -y -qq gh
+}
 
-  _pkg_as_root apt-get update -qq
+_install_gcloud() {
+  _pkg_as_root apt-get install -y -qq google-cloud-cli
+}
 
-  if [[ "$need_google_repo" -eq 1 || "$need_gh_repo" -eq 1 ]]; then
-    _pkg_as_root apt-get install -y -qq ca-certificates curl gnupg dirmngr apt-transport-https || return 1
+_install_docker() {
+  _pkg_as_root apt-get install -y -qq docker.io
+}
+
+_install_kubectl() {
+  if _debian_apt_cache_has_package kubectl; then
+    _pkg_as_root apt-get install -y -qq kubectl
   else
-    _pkg_as_root apt-get install -y -qq ca-certificates || true
+    echo "warning: debian: no apt package kubectl in current sources (skipped)." >&2
+  fi
+}
+
+_install_helm() {
+  if _debian_apt_cache_has_package helm; then
+    _pkg_as_root apt-get install -y -qq helm
+  else
+    echo "warning: debian: no apt package helm in current sources (skipped)." >&2
+  fi
+}
+
+_install_terraform() {
+  if _debian_apt_cache_has_package terraform; then
+    _pkg_as_root apt-get install -y -qq terraform
+  else
+    echo "warning: debian: no apt package terraform in current sources (skipped)." >&2
+  fi
+}
+
+# --- Toolchain: _setup_* (post-install; runs even when already installed) ---
+
+_setup_curl() {
+  :
+}
+
+_setup_git() {
+  local ssh_dir="$HOME/.ssh"
+  local ssh_config="$ssh_dir/config"
+  local chosen_private_key=""
+  local reply=""
+  local uname_s=""
+
+  _teemill_install_major_step "Git: SSH keys and GitHub host config"
+  echo "" >&2
+
+  if ! mkdir -p "$ssh_dir"; then
+    echo "could not create $ssh_dir" >&2
+    return 0
   fi
 
-  local google_list=/etc/apt/sources.list.d/google-cloud-sdk.list
-  local google_key=/usr/share/keyrings/google-cloud-teemill.gpg
+  if ! chmod 700 "$ssh_dir"; then
+    echo "could not chmod 700 $ssh_dir" >&2
+    return 0
+  fi
 
-  if [[ "$need_google_repo" -eq 1 ]]; then
-    if [[ ! -f "$google_list" ]]; then
-      curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | _pkg_as_root gpg --batch --yes --dearmor -o "$google_key"
-      echo "deb [signed-by=${google_key}] https://packages.cloud.google.com/apt cloud-sdk main" | _pkg_as_root tee "$google_list" >/dev/null
+  if [[ -f "$ssh_dir/id_ed25519" ]]; then
+    chosen_private_key="$ssh_dir/id_ed25519"
+  elif [[ -f "$ssh_dir/id_rsa" ]]; then
+    chosen_private_key="$ssh_dir/id_rsa"
+  fi
+
+  if [[ -z "$chosen_private_key" ]]; then
+    if [[ -t 1 ]] && [[ -r /dev/tty ]] && [[ -w /dev/tty ]]; then
+      printf 'generate SSH key at %s/id_ed25519? [Y/n] ' "$ssh_dir" >&2
+      read -r reply </dev/tty || reply="n"
+
+      case "${reply,,}" in
+        "" | y | yes)
+          echo "running ssh-keygen (set a passphrase on the TTY, or leave empty)." >&2
+
+          if ssh-keygen -t ed25519 -f "$ssh_dir/id_ed25519" \
+            -C "teemill-dev-starter-$(whoami)@$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo host)" \
+            </dev/tty; then
+            chosen_private_key="$ssh_dir/id_ed25519"
+          else
+            echo "ssh-keygen failed or aborted; create a key manually if needed." >&2
+          fi
+          ;;
+        *)
+          echo "skipped generating an SSH key." >&2
+          ;;
+      esac
+    else
+      echo "no default SSH key ($ssh_dir/id_ed25519 or id_rsa); non-interactive environment." >&2
+      echo "  ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519 -C \"you@example\"" >&2
+      echo "  eval \"\$(ssh-agent -s)\"; ssh-add ~/.ssh/id_ed25519" >&2
+      echo "  add the .pub key at https://github.com/settings/keys" >&2
     fi
   fi
 
-  local gh_list=/etc/apt/sources.list.d/github-cli.list
-  local gh_key=/usr/share/keyrings/githubcli-archive-keyring.gpg
+  if [[ -n "$chosen_private_key" ]]; then
+    uname_s="$(uname -s 2>/dev/null || echo "")"
 
-  if [[ "$need_gh_repo" -eq 1 ]]; then
-    if [[ ! -f "$gh_list" ]]; then
-      if ! command -v dpkg >/dev/null 2>&1; then
-        echo "teemill-install: apt-based install requires dpkg (Debian/Ubuntu)." >&2
-        return 1
+    if [[ "$uname_s" == "Darwin" ]]; then
+      if ! ssh-add --apple-use-keychain "$chosen_private_key" 2>/dev/null; then
+        ssh-add "$chosen_private_key" 2>/dev/null || {
+          echo "ssh-add failed; try: ssh-add --apple-use-keychain $chosen_private_key" >&2
+        }
+      fi
+    else
+      if ! ssh-add "$chosen_private_key" 2>/dev/null; then
+        echo "ssh-add failed (start an agent: eval \"\$(ssh-agent -s)\" then ssh-add \"$chosen_private_key\")." >&2
       fi
 
-      curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | _pkg_as_root tee "$gh_key" >/dev/null
-      _pkg_as_root chmod go+r "$gh_key" 2>/dev/null || true
-      echo "deb [arch=$(dpkg --print-architecture) signed-by=${gh_key}] https://cli.github.com/packages stable main" | _pkg_as_root tee "$gh_list" >/dev/null
+      if [[ -f "$ssh_config" ]]; then
+        if grep -qE '^[[:space:]]*Host[[:space:]]+github\.com([[:space:]]|$)' "$ssh_config"; then
+          :
+        else
+          {
+            echo ""
+            echo "# Added by Teemill dev-starter-kit (GitHub SSH defaults)"
+            echo "Host github.com"
+            echo "  AddKeysToAgent yes"
+            echo "  IdentitiesOnly yes"
+            echo "  IdentityFile $chosen_private_key"
+          } >>"$ssh_config"
+          chmod 600 "$ssh_config" 2>/dev/null || true
+          echo "appended Host github.com block to $ssh_config" >&2
+        fi
+      else
+        {
+          echo "# Added by Teemill dev-starter-kit (GitHub SSH defaults)"
+          echo "Host github.com"
+          echo "  AddKeysToAgent yes"
+          echo "  IdentitiesOnly yes"
+          echo "  IdentityFile $chosen_private_key"
+        } >"$ssh_config"
+        chmod 600 "$ssh_config" 2>/dev/null || true
+        echo "created $ssh_config with Host github.com defaults" >&2
+      fi
+    fi
+
+    if [[ -f "${chosen_private_key}.pub" ]]; then
+      echo "add this public key to GitHub if needed: https://github.com/settings/keys" >&2
+      echo "----" >&2
+      cat "${chosen_private_key}.pub" >&2
+      echo "----" >&2
+    fi
+  fi
+}
+
+_setup_gh() {
+  local gh_authenticated="false"
+  local git_name_val=""
+  local git_email_val=""
+  local api_login=""
+
+  _teemill_install_major_step "GitHub CLI: gh auth and git credential helper"
+  echo "" >&2
+
+  if gh config set -h github.com git_protocol ssh 2>/dev/null; then
+    :
+  elif gh config set git_protocol ssh 2>/dev/null; then
+    echo "set gh git_protocol ssh globally (no per-host flag on this gh version)." >&2
+  else
+    echo "could not set gh git_protocol ssh; try: gh config set -h github.com git_protocol ssh" >&2
+  fi
+
+  if gh auth status -h github.com >/dev/null 2>&1; then
+    gh_authenticated="true"
+  else
+    if gh auth status 2>&1 | grep -qi 'Logged in to github.com'; then
+      gh_authenticated="true"
     fi
   fi
 
-  if [[ "$need_google_repo" -eq 1 || "$need_gh_repo" -eq 1 ]]; then
-    _pkg_as_root apt-get update -qq
-  fi
+  if [[ "$gh_authenticated" == "true" ]]; then
+    echo "gh is already logged in to github.com." >&2
+  else
+    if [[ -t 1 ]] && [[ -r /dev/tty ]] && [[ -w /dev/tty ]]; then
+      echo "launching gh auth login (github.com, SSH, web; stdin from /dev/tty)." >&2
 
-  local -a install_pkgs=()
-
-  _selected_line_contains_tool_id "$want" "curl" && install_pkgs+=(curl)
-  _selected_line_contains_tool_id "$want" "git" && install_pkgs+=(git)
-  _selected_line_contains_tool_id "$want" "gh" && install_pkgs+=(gh)
-  _selected_line_contains_tool_id "$want" "gcloud" && install_pkgs+=(google-cloud-cli)
-  # docker.io from default Debian/Ubuntu repos (no Docker CE apt repo; engine is distro-managed).
-  _selected_line_contains_tool_id "$want" "docker" && install_pkgs+=(docker.io)
-
-  if _selected_line_contains_tool_id "$want" "kubectl"; then
-    if _debian_apt_cache_has_package kubectl; then
-      install_pkgs+=(kubectl)
+      if gh auth login -h github.com --git-protocol ssh --web </dev/tty; then
+        gh_authenticated="true"
+      else
+        echo "gh auth login failed; run: gh auth login -h github.com --git-protocol ssh --web" >&2
+      fi
     else
-      echo "teemill-install: warning: debian: no apt package kubectl in current sources (skipped)." >&2
+      echo "not interactive; run: gh auth login -h github.com --git-protocol ssh --web" >&2
     fi
   fi
 
-  if _selected_line_contains_tool_id "$want" "helm"; then
-    if _debian_apt_cache_has_package helm; then
-      install_pkgs+=(helm)
+  if [[ "$gh_authenticated" == "true" ]]; then
+    if gh auth setup-git -h github.com >/dev/null 2>&1; then
+      :
+    elif gh auth setup-git >/dev/null 2>&1; then
+      :
     else
-      echo "teemill-install: warning: debian: no apt package helm in current sources (skipped)." >&2
+      echo "gh auth setup-git failed or is unsupported on this gh version." >&2
+    fi
+
+    git_name_val="$(git config --global --get user.name 2>/dev/null || true)"
+    git_email_val="$(git config --global --get user.email 2>/dev/null || true)"
+
+    if [[ -z "$git_name_val" ]] || [[ -z "$git_email_val" ]]; then
+      api_login="$(GH_HOST=github.com gh api user -q .login 2>/dev/null || true)"
+
+      if [[ -n "$api_login" ]]; then
+        if [[ -z "$git_name_val" ]]; then
+          git config --global user.name "$api_login" || true
+        fi
+
+        if [[ -z "$git_email_val" ]]; then
+          git config --global user.email "${api_login}@users.noreply.github.com" || true
+        fi
+
+        echo "set missing git user.name / user.email from GitHub (${api_login}@users.noreply.github.com)." >&2
+      fi
     fi
   fi
+}
 
-  if _selected_line_contains_tool_id "$want" "terraform"; then
-    if _debian_apt_cache_has_package terraform; then
-      install_pkgs+=(terraform)
-    else
-      echo "teemill-install: warning: debian: no apt package terraform in current sources (skipped)." >&2
-    fi
-  fi
+_setup_gcloud() {
+  local active_account
 
-  if [[ "${#install_pkgs[@]}" -eq 0 ]]; then
-    echo "teemill-install: debian: nothing to install for this selection." >&2
-
+  if ! command -v gcloud >/dev/null 2>&1; then
     return 0
   fi
 
-  _pkg_as_root apt-get install -y -qq "${install_pkgs[@]}"
-}
+  _teemill_install_major_step "Google Cloud: gcloud auth login"
+  echo "" >&2
 
-_install_toolchain_homebrew() {
-  local want="$1"
+  active_account="$(gcloud auth list --filter=status:ACTIVE --format='value(account)' 2>/dev/null | head -n1)"
 
-  if ! command -v brew >/dev/null 2>&1; then
-    echo "teemill-install: Homebrew not found; install https://brew.sh then re-run." >&2
-    return 1
-  fi
-
-  brew update
-
-  local -a formulas=()
-
-  _selected_line_contains_tool_id "$want" "curl" && formulas+=(curl)
-  _selected_line_contains_tool_id "$want" "git" && formulas+=(git)
-  _selected_line_contains_tool_id "$want" "gh" && formulas+=(gh)
-  _selected_line_contains_tool_id "$want" "kubectl" && formulas+=(kubectl)
-  _selected_line_contains_tool_id "$want" "helm" && formulas+=(helm)
-  _selected_line_contains_tool_id "$want" "terraform" && formulas+=(terraform)
-
-  if [[ "${#formulas[@]}" -gt 0 ]]; then
-    brew install "${formulas[@]}" || brew upgrade "${formulas[@]}"
-  fi
-
-  if _selected_line_contains_tool_id "$want" "gcloud"; then
-    if command -v gcloud >/dev/null 2>&1; then
-      brew upgrade --cask google-cloud-sdk 2>/dev/null || true
-    else
-      brew install --cask google-cloud-sdk
-    fi
-  fi
-
-  if _selected_line_contains_tool_id "$want" "docker"; then
-    brew install docker || brew upgrade docker
-    echo "teemill-install: note: brew install docker provides the Docker CLI only; use Docker Desktop (brew install --cask docker) or Colima/Lima for a local engine if docker run fails." >&2
-  fi
-}
-
-_dnf_package_available() {
-  local candidate="$1"
-
-  dnf list -q --available "$candidate" &>/dev/null || dnf list -q --installed "$candidate" &>/dev/null
-}
-
-_install_toolchain_dnf() {
-  local want="$1"
-  local -a install_pkgs=()
-
-  _selected_line_contains_tool_id "$want" "curl" && install_pkgs+=(curl)
-  _selected_line_contains_tool_id "$want" "git" && install_pkgs+=(git)
-  _selected_line_contains_tool_id "$want" "gh" && install_pkgs+=(gh)
-  _selected_line_contains_tool_id "$want" "gcloud" && install_pkgs+=(google-cloud-cli)
-  _selected_line_contains_tool_id "$want" "docker" && install_pkgs+=(docker)
-
-  if _selected_line_contains_tool_id "$want" "kubectl"; then
-    if _dnf_package_available kubectl; then
-      install_pkgs+=(kubectl)
-    elif _dnf_package_available kubernetes-client; then
-      install_pkgs+=(kubernetes-client)
-    else
-      echo "teemill-install: warning: dnf: kubectl / kubernetes-client not found (skipped)." >&2
-    fi
-  fi
-
-  if _selected_line_contains_tool_id "$want" "helm"; then
-    if _dnf_package_available helm; then
-      install_pkgs+=(helm)
-    else
-      echo "teemill-install: warning: dnf: helm not found (skipped)." >&2
-    fi
-  fi
-
-  if _selected_line_contains_tool_id "$want" "terraform"; then
-    if _dnf_package_available terraform; then
-      install_pkgs+=(terraform)
-    else
-      echo "teemill-install: warning: dnf: terraform not found (skipped)." >&2
-    fi
-  fi
-
-  if [[ "${#install_pkgs[@]}" -eq 0 ]]; then
-    echo "teemill-install: dnf: nothing to install for this selection." >&2
-
+  if [[ -n "$active_account" ]]; then
+    echo "gcloud already has an active account (${active_account}); skipping gcloud auth login." >&2
     return 0
   fi
 
-  _pkg_as_root dnf install -y "${install_pkgs[@]}"
-}
-
-_install_toolchain_pacman() {
-  local want="$1"
-  local -a install_pkgs=()
-
-  _selected_line_contains_tool_id "$want" "curl" && install_pkgs+=(curl)
-  _selected_line_contains_tool_id "$want" "git" && install_pkgs+=(git)
-  _selected_line_contains_tool_id "$want" "gh" && install_pkgs+=(github-cli)
-  _selected_line_contains_tool_id "$want" "gcloud" && install_pkgs+=(google-cloud-cli)
-  _selected_line_contains_tool_id "$want" "docker" && install_pkgs+=(docker)
-  _selected_line_contains_tool_id "$want" "kubectl" && install_pkgs+=(kubectl)
-  _selected_line_contains_tool_id "$want" "helm" && install_pkgs+=(helm)
-  _selected_line_contains_tool_id "$want" "terraform" && install_pkgs+=(terraform)
-
-  if [[ "${#install_pkgs[@]}" -eq 0 ]]; then
-    echo "teemill-install: pacman: nothing to install for this selection." >&2
-
+  if [[ ! -t 1 ]]; then
+    echo "stdout is not a terminal; run manually when you can: gcloud auth login" >&2
     return 0
   fi
 
-  if ! _pkg_as_root pacman -S --noconfirm --needed "${install_pkgs[@]}"; then
-    local -a without_gcloud=()
-
-    for pkg in "${install_pkgs[@]}"; do
-      [[ "$pkg" == "google-cloud-cli" ]] && continue
-      without_gcloud+=("$pkg")
-    done
-
-    if [[ "${#without_gcloud[@]}" -gt 0 ]]; then
-      _pkg_as_root pacman -S --noconfirm --needed "${without_gcloud[@]}" || return 1
-    fi
-
-    if _selected_line_contains_tool_id "$want" "gcloud"; then
-      echo "teemill-install: pacman: google-cloud-cli install failed; install gcloud from Google docs if needed." >&2
-    fi
-  fi
-}
-
-_install_toolchain_apk() {
-  local want="$1"
-  local -a install_pkgs=()
-
-  _selected_line_contains_tool_id "$want" "curl" && install_pkgs+=(curl)
-  _selected_line_contains_tool_id "$want" "git" && install_pkgs+=(git)
-  _selected_line_contains_tool_id "$want" "gh" && install_pkgs+=(github-cli)
-  _selected_line_contains_tool_id "$want" "gcloud" && install_pkgs+=(google-cloud-cli)
-  _selected_line_contains_tool_id "$want" "docker" && install_pkgs+=(docker)
-  _selected_line_contains_tool_id "$want" "kubectl" && install_pkgs+=(kubectl)
-  _selected_line_contains_tool_id "$want" "helm" && install_pkgs+=(helm)
-  _selected_line_contains_tool_id "$want" "terraform" && install_pkgs+=(terraform)
-
-  if [[ "${#install_pkgs[@]}" -eq 0 ]]; then
-    echo "teemill-install: apk: nothing to install for this selection." >&2
-
+  if [[ ! -r /dev/tty ]] || [[ ! -w /dev/tty ]]; then
+    echo "/dev/tty not available; run manually: gcloud auth login" >&2
     return 0
   fi
 
-  if ! _pkg_as_root apk add --no-cache "${install_pkgs[@]}"; then
-    local -a without_gcloud=()
+  echo "launching gcloud auth login (browser or device flow; stdin from /dev/tty)." >&2
 
-    for pkg in "${install_pkgs[@]}"; do
-      [[ "$pkg" == "google-cloud-cli" ]] && continue
-      without_gcloud+=("$pkg")
-    done
-
-    if [[ "${#without_gcloud[@]}" -gt 0 ]]; then
-      _pkg_as_root apk add --no-cache "${without_gcloud[@]}" || return 1
-    fi
-
-    if _selected_line_contains_tool_id "$want" "gcloud"; then
-      echo "teemill-install: apk: google-cloud-cli install failed; install gcloud from Google docs if needed." >&2
-    fi
-  fi
+  gcloud auth login </dev/tty || {
+    echo "gcloud auth login exited with status $?." >&2
+  }
 }
 
-_install_toolchain_yum() {
-  local want="$1"
-  local -a base=()
-
-  _selected_line_contains_tool_id "$want" "curl" && base+=(curl)
-  _selected_line_contains_tool_id "$want" "git" && base+=(git)
-
-  if [[ "${#base[@]}" -gt 0 ]]; then
-    _pkg_as_root yum install -y -q "${base[@]}" || true
-  fi
-
-  local -a vendor=()
-
-  _selected_line_contains_tool_id "$want" "gh" && vendor+=(gh)
-  _selected_line_contains_tool_id "$want" "gcloud" && vendor+=(google-cloud-cli)
-  _selected_line_contains_tool_id "$want" "docker" && vendor+=(docker)
-  _selected_line_contains_tool_id "$want" "kubectl" && vendor+=(kubectl)
-  _selected_line_contains_tool_id "$want" "helm" && vendor+=(helm)
-  _selected_line_contains_tool_id "$want" "terraform" && vendor+=(terraform)
-
-  if [[ "${#vendor[@]}" -gt 0 ]]; then
-    if ! _pkg_as_root yum install -y -q "${vendor[@]}" 2>/dev/null; then
-      echo "teemill-install: yum: some packages missing in repos; install gh/gcloud/docker/k8s tools from vendor docs if needed." >&2
-    fi
-  fi
+_setup_docker() {
+  _teemill_add_login_user_to_docker_group_if_wanted "${TEEMILL_BOOTSTRAP_SELECTED_TOOLS:-}"
 }
 
-_install_toolchain_zypper() {
-  local want="$1"
-  local -a base=()
+_setup_kubectl() {
+  :
+}
 
-  _selected_line_contains_tool_id "$want" "curl" && base+=(curl)
-  _selected_line_contains_tool_id "$want" "git" && base+=(git)
+_setup_helm() {
+  :
+}
 
-  if [[ "${#base[@]}" -gt 0 ]]; then
-    _pkg_as_root zypper --non-interactive install -y "${base[@]}" || true
-  fi
-
-  local -a extra=()
-
-  _selected_line_contains_tool_id "$want" "gh" && extra+=(gh)
-  _selected_line_contains_tool_id "$want" "gcloud" && extra+=(google-cloud-cli)
-  _selected_line_contains_tool_id "$want" "docker" && extra+=(docker)
-  _selected_line_contains_tool_id "$want" "kubectl" && extra+=(kubectl)
-  _selected_line_contains_tool_id "$want" "helm" && extra+=(helm)
-  _selected_line_contains_tool_id "$want" "terraform" && extra+=(terraform)
-
-  if [[ "${#extra[@]}" -gt 0 ]]; then
-    _pkg_as_root zypper --non-interactive install -y "${extra[@]}" 2>/dev/null || {
-      echo "teemill-install: zypper: some optional packages missing; install from vendor docs if needed." >&2
-    }
-  fi
+_setup_terraform() {
+  :
 }
 
 # Linux: add the login user to group "docker" so docker(1) can use the daemon socket without sudo.
-# Requires a one-time privileged usermod (same sudo path as package installs). New group membership applies after re-login or: newgrp docker
 _teemill_add_login_user_to_docker_group_if_wanted() {
   local want="${1:?}"
   local target_user=""
@@ -769,7 +780,7 @@ _teemill_add_login_user_to_docker_group_if_wanted() {
   [[ "$(uname -s)" == "Linux" ]] || return 0
   _selected_line_contains_tool_id "$want" "docker" || return 0
   getent group docker >/dev/null 2>&1 || {
-    echo "teemill-install: docker group not found; skipping usermod (install docker package first)." >&2
+    echo "docker group not found; skipping usermod (install docker package first)." >&2
     return 0
   }
 
@@ -784,12 +795,12 @@ _teemill_add_login_user_to_docker_group_if_wanted() {
   fi
 
   if [[ -z "$target_user" || "$target_user" == "root" ]]; then
-    echo "teemill-install: could not determine a non-root login user; add yourself to docker manually: sudo usermod -aG docker \"\$USER\"" >&2
+    echo "could not determine a non-root login user; add yourself to docker manually: sudo usermod -aG docker \"\$USER\"" >&2
     return 0
   fi
 
   if id -nG "$target_user" 2>/dev/null | tr ' ' '\n' | grep -qx docker; then
-    echo "teemill-install: user ${target_user} is already in the docker group." >&2
+    echo "user ${target_user} is already in the docker group." >&2
     return 0
   fi
 
@@ -797,44 +808,77 @@ _teemill_add_login_user_to_docker_group_if_wanted() {
   echo "" >&2
 
   if _pkg_as_root usermod -aG docker "$target_user"; then
-    echo "teemill-install: added ${target_user} to group docker — log out and back in, or run: newgrp docker  (then docker commands work without sudo)." >&2
+    echo "added ${target_user} to group docker — log out and back in, or run: newgrp docker  (then docker commands work without sudo)." >&2
   else
-    echo "teemill-install: usermod -aG docker ${target_user} failed; run manually with sudo when you can." >&2
+    echo "usermod -aG docker ${target_user} failed; run manually with sudo when you can." >&2
   fi
+}
+
+# Runs per-selected toolchain id in manifest order, then gcloud/git/gh (clone prep).
+_teemill_toolchain_apply_setups() {
+  local selected_line="${1:-}"
+  local dry_run="${2:-false}"
+  local id
+  local fn
+
+  if [[ "$dry_run" == "true" ]]; then
+    _setup_git || true
+    _setup_gh || true
+    return 0
+  fi
+
+  TEEMILL_BOOTSTRAP_SELECTED_TOOLS="$selected_line"
+
+  for id in $TEEMILL_TOOL_IDS_ORDER; do
+    _selected_line_contains_tool_id "$selected_line" "$id" || continue
+    case "$id" in
+      git | gh | gcloud) continue ;;
+    esac
+    fn="_setup_${id}"
+
+    if _teemill_declare_fn "$fn"; then
+      "$fn" || true
+    fi
+  done
+
+  _setup_gcloud || true
+  _setup_git || true
+  _setup_gh || true
 }
 
 install_toolchain_for_platform() {
   local want="${1:-}"
+  local id
+  local install_fn
 
   if [[ -z "${want// }" ]]; then
     return 0
   fi
 
-  if [[ "$(uname -s)" == "Darwin" ]] && command -v brew >/dev/null 2>&1; then
-    _install_toolchain_homebrew "$want"
-    return
-  fi
-
-  if command -v apt-get >/dev/null 2>&1; then
-    _install_toolchain_debian "$want" || return $?
-  elif command -v dnf >/dev/null 2>&1; then
-    _install_toolchain_dnf "$want" || return $?
-  elif command -v yum >/dev/null 2>&1; then
-    _install_toolchain_yum "$want" || return $?
-  elif command -v zypper >/dev/null 2>&1; then
-    _install_toolchain_zypper "$want" || return $?
-  elif command -v pacman >/dev/null 2>&1; then
-    _install_toolchain_pacman "$want" || return $?
-  elif command -v apk >/dev/null 2>&1; then
-    _install_toolchain_apk "$want" || return $?
-  else
-    echo "teemill-install: no supported package manager; install selected tools manually." >&2
+  if ! command -v apt-get >/dev/null 2>&1; then
+    echo "this script only supports Debian/Ubuntu (apt-get not found)." >&2
     return 1
   fi
 
-  _teemill_add_login_user_to_docker_group_if_wanted "$want"
+  _teemill_prepare_debian_apt_for_selected "$want" || return $?
+
+  for id in $TEEMILL_TOOL_IDS_ORDER; do
+    _selected_line_contains_tool_id "$want" "$id" || continue
+    install_fn="_install_${id}"
+
+    if ! _teemill_declare_fn "$install_fn"; then
+      echo "internal error: missing ${install_fn} for toolchain id ${id}." >&2
+      return 1
+    fi
+
+    if ! "$install_fn"; then
+      return $?
+    fi
+  done
+
   return 0
 }
+
 
 
 _teemill_toggle_version_or_dash() {
@@ -862,20 +906,11 @@ _toolchain_manifest_line_installed() {
   local _root="$1"
   local manifest_line="$2"
   local tool_id
+  local v
 
   tool_id="$(manifest_field "$manifest_line" 1)"
-
-  case "$tool_id" in
-    curl) command -v curl >/dev/null 2>&1 ;;
-    git) command -v git >/dev/null 2>&1 ;;
-    gh) command -v gh >/dev/null 2>&1 ;;
-    gcloud) command -v gcloud >/dev/null 2>&1 ;;
-    docker) command -v docker >/dev/null 2>&1 ;;
-    kubectl) command -v kubectl >/dev/null 2>&1 ;;
-    helm) command -v helm >/dev/null 2>&1 ;;
-    terraform) command -v terraform >/dev/null 2>&1 ;;
-    *) return 1 ;;
-  esac
+  v="$(_teemill_invoke_version_stdout "$tool_id")"
+  [[ -n "${v// }" ]]
 }
 
 _teemill_toggle_toolchain_installed_version() {
@@ -884,19 +919,7 @@ _teemill_toggle_toolchain_installed_version() {
   local tool_id raw
 
   tool_id="$(manifest_field "$manifest_line" 1)"
-
-  case "$tool_id" in
-    curl) raw="$(_installed_version_curl)" ;;
-    git) raw="$(_installed_version_git)" ;;
-    gh) raw="$(_installed_version_gh)" ;;
-    gcloud) raw="$(_installed_version_gcloud_sdk)" ;;
-    docker) raw="$(_installed_version_docker)" ;;
-    kubectl) raw="$(_installed_version_kubectl)" ;;
-    helm) raw="$(_installed_version_helm)" ;;
-    terraform) raw="$(_installed_version_terraform)" ;;
-    *) raw="" ;;
-  esac
-
+  raw="$(_teemill_invoke_version_stdout "$tool_id")"
   _teemill_toggle_version_or_dash "$raw"
 }
 
@@ -906,24 +929,12 @@ _teemill_toggle_toolchain_target_version() {
   local tool_id raw
 
   tool_id="$(manifest_field "$manifest_line" 1)"
-
-  case "$tool_id" in
-    curl) raw="$(_latest_upstream_curl_tag)" ;;
-    git) raw="$(_latest_upstream_git_tag)" ;;
-    gh) raw="$(_latest_upstream_gh_tag)" ;;
-    gcloud) raw="$(_latest_upstream_gcloud_version)" ;;
-    docker) printf 'distro'; return ;;
-    kubectl) raw="$(_latest_upstream_kubectl_version)" ;;
-    helm) raw="$(_latest_upstream_helm_tag)" ;;
-    terraform) raw="$(_latest_upstream_terraform_tag)" ;;
-    *) raw="" ;;
-  esac
-
+  raw="$(_teemill_invoke_upstream_stdout "$tool_id")"
   _teemill_toggle_version_or_dash "$raw"
 }
 
 
-_teemill_toggle_repo_installed_version() {
+_version_repo_default() {
   local teemill_root="$1"
   local manifest_line="$2"
   local dest rev
@@ -931,17 +942,31 @@ _teemill_toggle_repo_installed_version() {
   dest="$(manifest_clone_target_path "$teemill_root" "$manifest_line")"
 
   if [[ ! -d "$dest/.git" ]]; then
-    printf '-'
-
+    echo ""
     return
   fi
 
   rev="$(git -C "$dest" rev-parse --short HEAD 2>/dev/null)"
-
-  _teemill_toggle_version_or_dash "$rev"
+  echo "$rev"
 }
 
-_teemill_toggle_repo_target_version() {
+_version_repo() {
+  local teemill_root="$1"
+  local manifest_line="$2"
+  local repo_id
+  local fn
+
+  repo_id="$(manifest_field "$manifest_line" 1)"
+  fn="_version_repo_$(_teemill_ident_safe "$repo_id")"
+
+  if _teemill_declare_fn "$fn"; then
+    "$fn" "$teemill_root" "$manifest_line"
+  else
+    _version_repo_default "$teemill_root" "$manifest_line"
+  fi
+}
+
+_upstream_repo_default() {
   local _root="$1"
   local manifest_line="$2"
   local url head
@@ -949,227 +974,154 @@ _teemill_toggle_repo_target_version() {
   url="$(manifest_field "$manifest_line" 3)"
 
   if [[ -z "$url" ]]; then
-    printf '-'
-
+    echo ""
     return
   fi
 
   head="$(GIT_SSH_COMMAND="ssh -o BatchMode=yes -o ConnectTimeout=5" timeout 10 git ls-remote "$url" HEAD 2>/dev/null | awk '{print substr($1,1,9)}')"
-
-  _teemill_toggle_version_or_dash "$head"
+  echo "$head"
 }
 
+_upstream_repo() {
+  local teemill_root="$1"
+  local manifest_line="$2"
+  local repo_id
+  local fn
 
-_run_gcloud_auth_login_step() {
-  local active_account
+  repo_id="$(manifest_field "$manifest_line" 1)"
+  fn="_upstream_repo_$(_teemill_ident_safe "$repo_id")"
 
-  if ! command -v gcloud >/dev/null 2>&1; then
-    return 0
+  if _teemill_declare_fn "$fn"; then
+    "$fn" "$teemill_root" "$manifest_line"
+  else
+    _upstream_repo_default "$teemill_root" "$manifest_line"
   fi
-
-  _teemill_install_major_step "Google Cloud: gcloud auth login"
-  echo "" >&2
-
-  active_account="$(gcloud auth list --filter=status:ACTIVE --format='value(account)' 2>/dev/null | head -n1)"
-
-  if [[ -n "$active_account" ]]; then
-    echo "teemill-install: gcloud already has an active account (${active_account}); skipping gcloud auth login." >&2
-
-    return 0
-  fi
-
-  if [[ ! -t 1 ]]; then
-    echo "teemill-install: stdout is not a terminal; run manually when you can: gcloud auth login" >&2
-
-    return 0
-  fi
-
-  if [[ ! -r /dev/tty ]] || [[ ! -w /dev/tty ]]; then
-    echo "teemill-install: /dev/tty not available; run manually: gcloud auth login" >&2
-
-    return 0
-  fi
-
-  echo "teemill-install: launching gcloud auth login (browser or device flow; stdin from /dev/tty)." >&2
-
-  gcloud auth login </dev/tty || {
-    echo "teemill-install: gcloud auth login exited with status $?." >&2
-  }
 }
 
-# SSH key + ssh-agent (Keychain on macOS), gh git_protocol ssh, gh auth login + setup-git, and optional
-# git user.name / user.email from GitHub login + noreply email when those globals are unset.
-_configure_git_gh_ssh_and_auth_step() {
-  local ssh_dir="$HOME/.ssh"
-  local ssh_config="$ssh_dir/config"
-  local chosen_private_key=""
-  local reply=""
-  local gh_authenticated="false"
-  local git_name_val=""
-  local git_email_val=""
-  local api_login=""
-  local uname_s=""
+_teemill_toggle_repo_installed_version() {
+  local teemill_root="$1"
+  local manifest_line="$2"
+  local raw
 
-  _teemill_install_major_step "Git, GitHub SSH, and gh authentication"
-  echo "" >&2
+  raw="$(_version_repo "$teemill_root" "$manifest_line")"
+  raw="${raw//$'\n'/ }"
+  raw="${raw//[[:space:]]/}"
+  _teemill_toggle_version_or_dash "$raw"
+}
 
-  if ! mkdir -p "$ssh_dir"; then
-    echo "teemill-install: could not create $ssh_dir" >&2
+_teemill_toggle_repo_target_version() {
+  local teemill_root="$1"
+  local manifest_line="$2"
+  local raw
+
+  raw="$(_upstream_repo "$teemill_root" "$manifest_line")"
+  raw="${raw//$'\n'/ }"
+  raw="${raw//[[:space:]]/}"
+  _teemill_toggle_version_or_dash "$raw"
+}
+
+# --- Repos: _install_repo_* / _setup_repo_* (hyphen ids → _ident_safe suffix) ---
+
+_install_repo_default() {
+  local teemill_root="${1:?}"
+  local repo_id="${2:?}"
+  local match_line="" manifest_line id url dest_path
+
+  while IFS= read -r manifest_line; do
+    [[ -z "$manifest_line" ]] && continue
+    id="$(manifest_field "$manifest_line" 1)"
+
+    if [[ "$id" == "$repo_id" ]]; then
+      match_line="$manifest_line"
+      break
+    fi
+  done < <(parse_manifest_lines)
+
+  if [[ -z "$match_line" ]]; then
+    echo "internal error: unknown repo id for install: $repo_id" >&2
+    return 1
+  fi
+
+  url="$(manifest_field "$match_line" 3)"
+  dest_path="$(manifest_clone_target_path "$teemill_root" "$match_line")"
+
+  if is_manifest_repo_installed "$teemill_root" "$match_line"; then
+    echo "skip (already a git repo): $dest_path" >&2
     return 0
   fi
 
-  if ! chmod 700 "$ssh_dir"; then
-    echo "teemill-install: could not chmod 700 $ssh_dir" >&2
+  if [[ -e "$dest_path" ]]; then
+    echo "skip (path exists and is not an empty git clone target): $dest_path" >&2
     return 0
   fi
 
-  if [[ -f "$ssh_dir/id_ed25519" ]]; then
-    chosen_private_key="$ssh_dir/id_ed25519"
-  elif [[ -f "$ssh_dir/id_rsa" ]]; then
-    chosen_private_key="$ssh_dir/id_rsa"
+  echo "cloning $repo_id -> $dest_path" >&2
+  git clone "$url" "$dest_path"
+}
+
+_install_repo_frontend() {
+  local teemill_root="${1:?}"
+  local repo_id="${2:?}"
+  local match_line="" manifest_line id url dest_path
+
+  while IFS= read -r manifest_line; do
+    [[ -z "$manifest_line" ]] && continue
+    id="$(manifest_field "$manifest_line" 1)"
+
+    if [[ "$id" == "$repo_id" ]]; then
+      match_line="$manifest_line"
+      break
+    fi
+  done < <(parse_manifest_lines)
+
+  if [[ -z "$match_line" ]]; then
+    echo "internal error: unknown repo id for install: $repo_id" >&2
+    return 1
   fi
 
-  if [[ -z "$chosen_private_key" ]]; then
-    if [[ -t 1 ]] && [[ -r /dev/tty ]] && [[ -w /dev/tty ]]; then
-      printf 'teemill-install: generate SSH key at %s/id_ed25519? [Y/n] ' "$ssh_dir" >&2
-      read -r reply </dev/tty || reply="n"
+  url="$(manifest_field "$match_line" 3)"
+  dest_path="$(manifest_clone_target_path "$teemill_root" "$match_line")"
 
-      case "${reply,,}" in
-        "" | y | yes)
-          echo "teemill-install: running ssh-keygen (set a passphrase on the TTY, or leave empty)." >&2
-
-          if ssh-keygen -t ed25519 -f "$ssh_dir/id_ed25519" \
-            -C "teemill-install-$(whoami)@$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo host)" \
-            </dev/tty; then
-            chosen_private_key="$ssh_dir/id_ed25519"
-          else
-            echo "teemill-install: ssh-keygen failed or aborted; create a key manually if needed." >&2
-          fi
-          ;;
-        *)
-          echo "teemill-install: skipped generating an SSH key." >&2
-          ;;
-      esac
-    else
-      echo "teemill-install: no default SSH key ($ssh_dir/id_ed25519 or id_rsa); non-interactive environment." >&2
-      echo "teemill-install:   ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519 -C \"you@example\"" >&2
-      echo "teemill-install:   eval \"\$(ssh-agent -s)\"; ssh-add ~/.ssh/id_ed25519" >&2
-      echo "teemill-install:   add the .pub key at https://github.com/settings/keys" >&2
-    fi
+  if is_manifest_repo_installed "$teemill_root" "$match_line"; then
+    echo "skip (already a git repo): $dest_path" >&2
+    return 0
   fi
 
-  if [[ -n "$chosen_private_key" ]]; then
-    uname_s="$(uname -s 2>/dev/null || echo "")"
-
-    if [[ "$uname_s" == "Darwin" ]]; then
-      if ! ssh-add --apple-use-keychain "$chosen_private_key" 2>/dev/null; then
-        ssh-add "$chosen_private_key" 2>/dev/null || {
-          echo "teemill-install: ssh-add failed; try: ssh-add --apple-use-keychain $chosen_private_key" >&2
-        }
-      fi
-    else
-      if ! ssh-add "$chosen_private_key" 2>/dev/null; then
-        echo "teemill-install: ssh-add failed (start an agent: eval \"\$(ssh-agent -s)\" then ssh-add \"$chosen_private_key\")." >&2
-      fi
-
-      if [[ -f "$ssh_config" ]]; then
-        if grep -qE '^[[:space:]]*Host[[:space:]]+github\.com([[:space:]]|$)' "$ssh_config"; then
-          :
-        else
-          {
-            echo ""
-            echo "# Added by teemill-install (GitHub SSH defaults)"
-            echo "Host github.com"
-            echo "  AddKeysToAgent yes"
-            echo "  IdentitiesOnly yes"
-            echo "  IdentityFile $chosen_private_key"
-          } >>"$ssh_config"
-          chmod 600 "$ssh_config" 2>/dev/null || true
-          echo "teemill-install: appended Host github.com block to $ssh_config" >&2
-        fi
-      else
-        {
-          echo "# Added by teemill-install (GitHub SSH defaults)"
-          echo "Host github.com"
-          echo "  AddKeysToAgent yes"
-          echo "  IdentitiesOnly yes"
-          echo "  IdentityFile $chosen_private_key"
-        } >"$ssh_config"
-        chmod 600 "$ssh_config" 2>/dev/null || true
-        echo "teemill-install: created $ssh_config with Host github.com defaults" >&2
-      fi
-    fi
-
-    if [[ -f "${chosen_private_key}.pub" ]]; then
-      echo "teemill-install: add this public key to GitHub if needed: https://github.com/settings/keys" >&2
-      echo "teemill-install: ----" >&2
-      cat "${chosen_private_key}.pub" >&2
-      echo "teemill-install: ----" >&2
-    fi
+  if [[ -e "$dest_path" ]]; then
+    echo "skip (path exists and is not an empty git clone target): $dest_path" >&2
+    return 0
   fi
 
-  if gh config set -h github.com git_protocol ssh 2>/dev/null; then
-    :
-  elif gh config set git_protocol ssh 2>/dev/null; then
-    echo "teemill-install: set gh git_protocol ssh globally (no per-host flag on this gh version)." >&2
+  echo "cloning $repo_id -> $dest_path (partial clone)" >&2
+  git clone --filter=blob:none "$url" "$dest_path"
+}
+
+_install_repo_frontend_legacy() {
+  _install_repo_frontend "$1" "$2"
+}
+
+_install_repo() {
+  local teemill_root="${1:?}"
+  local repo_id="${2:?}"
+  local fn="_install_repo_$(_teemill_ident_safe "$repo_id")"
+
+  if _teemill_declare_fn "$fn"; then
+    "$fn" "$teemill_root" "$repo_id"
   else
-    echo "teemill-install: could not set gh git_protocol ssh; try: gh config set -h github.com git_protocol ssh" >&2
-  fi
-
-  if gh auth status -h github.com >/dev/null 2>&1; then
-    gh_authenticated="true"
-  else
-    if gh auth status 2>&1 | grep -qi 'Logged in to github.com'; then
-      gh_authenticated="true"
-    fi
-  fi
-
-  if [[ "$gh_authenticated" == "true" ]]; then
-    echo "teemill-install: gh is already logged in to github.com." >&2
-  else
-    if [[ -t 1 ]] && [[ -r /dev/tty ]] && [[ -w /dev/tty ]]; then
-      echo "teemill-install: launching gh auth login (github.com, SSH, web; stdin from /dev/tty)." >&2
-
-      if gh auth login -h github.com --git-protocol ssh --web </dev/tty; then
-        gh_authenticated="true"
-      else
-        echo "teemill-install: gh auth login failed; run: gh auth login -h github.com --git-protocol ssh --web" >&2
-      fi
-    else
-      echo "teemill-install: not interactive; run: gh auth login -h github.com --git-protocol ssh --web" >&2
-    fi
-  fi
-
-  if [[ "$gh_authenticated" == "true" ]]; then
-    if gh auth setup-git -h github.com >/dev/null 2>&1; then
-      :
-    elif gh auth setup-git >/dev/null 2>&1; then
-      :
-    else
-      echo "teemill-install: gh auth setup-git failed or is unsupported on this gh version." >&2
-    fi
-
-    # If user.name / user.email are unset, use GitHub login and GitHub noreply (private email on commits).
-    git_name_val="$(git config --global --get user.name 2>/dev/null || true)"
-    git_email_val="$(git config --global --get user.email 2>/dev/null || true)"
-
-    if [[ -z "$git_name_val" ]] || [[ -z "$git_email_val" ]]; then
-      api_login="$(GH_HOST=github.com gh api user -q .login 2>/dev/null || true)"
-
-      if [[ -n "$api_login" ]]; then
-        if [[ -z "$git_name_val" ]]; then
-          git config --global user.name "$api_login" || true
-        fi
-
-        if [[ -z "$git_email_val" ]]; then
-          git config --global user.email "${api_login}@users.noreply.github.com" || true
-        fi
-
-        echo "teemill-install: set missing git user.name / user.email from GitHub (${api_login}@users.noreply.github.com)." >&2
-      fi
-    fi
+    _install_repo_default "$teemill_root" "$repo_id"
   fi
 }
+
+_setup_repo() {
+  local teemill_root="${1:?}"
+  local repo_id="${2:?}"
+  local fn="_setup_repo_$(_teemill_ident_safe "$repo_id")"
+
+  if _teemill_declare_fn "$fn"; then
+    "$fn" "$teemill_root" "$repo_id"
+  fi
+}
+
 
 # True when /etc/os-release declares ID=ubuntu (not derivatives unless ID is exactly ubuntu).
 _teemill_os_release_id_is_ubuntu_strict() {
@@ -1268,7 +1220,7 @@ _teemill_resolve_primary_ide_desktop_basename() {
         return 0
       fi
 
-      echo "teemill-install: warning: cursor.desktop not found; trying other IDE .desktop files for dock." >&2
+      echo "warning: cursor.desktop not found; trying other IDE .desktop files for dock." >&2
       ;;
     jetbrains-toolbox)
       if _teemill_desktop_basename_is_installed "jetbrains-toolbox.desktop"; then
@@ -1276,13 +1228,13 @@ _teemill_resolve_primary_ide_desktop_basename() {
         return 0
       fi
 
-      echo "teemill-install: warning: jetbrains-toolbox.desktop not found; trying other IDE .desktop files for dock." >&2
+      echo "warning: jetbrains-toolbox.desktop not found; trying other IDE .desktop files for dock." >&2
       ;;
     skip)
-      echo "teemill-install: note: picking first available IDE .desktop for dock (no IDE install step)." >&2
+      echo "note: picking first available IDE .desktop for dock (no IDE install step)." >&2
       ;;
     *)
-      echo "teemill-install: warning: unknown IDE id '${ide_choice}'; picking first available IDE .desktop for dock." >&2
+      echo "warning: unknown IDE id '${ide_choice}'; picking first available IDE .desktop for dock." >&2
       ;;
   esac
 
@@ -1335,23 +1287,23 @@ bootstrap_ubuntu_gnome_favorite_apps() {
 
   if ! _teemill_os_release_id_is_ubuntu_strict; then
     if [[ "${TEEMILL_DEBUG:-}" == "1" ]]; then
-      echo "teemill-install: debug: skipping Ubuntu GNOME favorites (not ID=ubuntu)." >&2
+      echo "debug: skipping Ubuntu GNOME favorites (not ID=ubuntu)." >&2
     fi
 
     return 0
   fi
 
   if ! command -v gsettings >/dev/null 2>&1; then
-    echo "teemill-install: Ubuntu: skipping dock favorites (gsettings not installed). Manual: gsettings set org.gnome.shell favorite-apps \"['firefox.desktop','cursor.desktop','org.gnome.Terminal.desktop']\" (adjust .desktop basenames)." >&2
+    echo "Ubuntu: skipping dock favorites (gsettings not installed). Manual: gsettings set org.gnome.shell favorite-apps \"['firefox.desktop','cursor.desktop','org.gnome.Terminal.desktop']\" (adjust .desktop basenames)." >&2
 
     return 0
   fi
 
   if ! _teemill_ubuntu_gnome_favorites_can_use_gsettings; then
-    echo "teemill-install: Ubuntu: skipping dock favorites (gsettings cannot read org.gnome.shell; need GNOME Shell and a usable session D-Bus). Settings > Ubuntu Desktop > Dock, or: gsettings set org.gnome.shell favorite-apps \"[...]\". Over SSH, export DBUS_SESSION_BUS_ADDRESS from your graphical login, or run this from a terminal on the machine." >&2
+    echo "Ubuntu: skipping dock favorites (gsettings cannot read org.gnome.shell; need GNOME Shell and a usable session D-Bus). Settings > Ubuntu Desktop > Dock, or: gsettings set org.gnome.shell favorite-apps \"[...]\". Over SSH, export DBUS_SESSION_BUS_ADDRESS from your graphical login, or run this from a terminal on the machine." >&2
 
     if [[ -z "${DISPLAY:-}" && -z "${WAYLAND_DISPLAY:-}" && -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
-      echo "teemill-install: Ubuntu: DISPLAY, WAYLAND_DISPLAY, and DBUS_SESSION_BUS_ADDRESS are unset." >&2
+      echo "Ubuntu: DISPLAY, WAYLAND_DISPLAY, and DBUS_SESSION_BUS_ADDRESS are unset." >&2
     fi
 
     return 0
@@ -1369,25 +1321,25 @@ bootstrap_ubuntu_gnome_favorite_apps() {
   [[ -n "$terminal_desktop" ]] && resolved_count=$((resolved_count + 1))
 
   if [[ -z "$browser_desktop" ]]; then
-    echo "teemill-install: warning: could not resolve default browser .desktop for dock favorites." >&2
+    echo "warning: could not resolve default browser .desktop for dock favorites." >&2
   fi
 
   if [[ -z "$ide_desktop" ]]; then
-    echo "teemill-install: warning: could not resolve IDE .desktop for dock favorites." >&2
+    echo "warning: could not resolve IDE .desktop for dock favorites." >&2
   fi
 
   if [[ -z "$terminal_desktop" ]]; then
-    echo "teemill-install: warning: could not resolve terminal .desktop for dock favorites." >&2
+    echo "warning: could not resolve terminal .desktop for dock favorites." >&2
   fi
 
   if [[ "$resolved_count" -lt 2 ]]; then
-    echo "teemill-install: Ubuntu: not changing dock favorites (need at least two resolved .desktop entries; got ${resolved_count})." >&2
+    echo "Ubuntu: not changing dock favorites (need at least two resolved .desktop entries; got ${resolved_count})." >&2
 
     return 0
   fi
 
   if [[ "$resolved_count" -lt 3 ]]; then
-    echo "teemill-install: warning: applying partial dock favorites (${resolved_count}/3 .desktop entries resolved)." >&2
+    echo "warning: applying partial dock favorites (${resolved_count}/3 .desktop entries resolved)." >&2
   fi
 
   if [[ -n "$browser_desktop" ]]; then
@@ -1405,12 +1357,12 @@ bootstrap_ubuntu_gnome_favorite_apps() {
   gvariant="$(_teemill_gvariant_favorite_apps_array "${favorites_list[@]}")"
 
   if ! gsettings set org.gnome.shell favorite-apps "$gvariant"; then
-    echo "teemill-install: Ubuntu: gsettings set org.gnome.shell favorite-apps failed; configure the dock manually." >&2
+    echo "Ubuntu: gsettings set org.gnome.shell favorite-apps failed; configure the dock manually." >&2
 
     return 0
   fi
 
-  echo "teemill-install: Ubuntu GNOME Shell dock favorites set to: ${favorites_list[*]}" >&2
+  echo "Ubuntu GNOME Shell dock favorites set to: ${favorites_list[*]}" >&2
 }
 
 # Creates workspace root, optional toolchain (multi-select), then auth steps.
@@ -1423,24 +1375,20 @@ bootstrap_environment() {
   local selected_tools_line="${4:-}"
 
   mkdir -p "$workspace_root" || {
-    echo "teemill-install: could not create directory: $workspace_root" >&2
+    echo "could not create directory: $workspace_root" >&2
     exit 2
   }
 
   if [[ -z "${selected_tools_line// }" ]]; then
     _teemill_install_major_step "Toolchain: skipped (nothing selected)"
     echo "" >&2
-    echo "teemill-install: no toolchain packages selected; skipping toolchain install and version summary." >&2
+    echo "no toolchain packages selected; skipping toolchain install and version summary." >&2
 
-    if [[ "$dry_run" != "true" ]]; then
-      _run_gcloud_auth_login_step
-    fi
-
-    _configure_git_gh_ssh_and_auth_step
+    _teemill_toolchain_apply_setups "" "$dry_run"
 
     _teemill_install_major_step "Next: clone Teemill repositories over SSH"
     echo "" >&2
-    echo "teemill-install: clones use SSH (git@github.com:Teemill/…). Ensure your GitHub SSH key is loaded." >&2
+    echo "clones use SSH (git@github.com:Teemill/…). Ensure your GitHub SSH key is loaded." >&2
 
     return 0
   fi
@@ -1450,11 +1398,11 @@ bootstrap_environment() {
   if [[ "$dry_run" == "true" ]]; then
     _print_toolchain_dry_run_package_plan "$selected_tools_line"
 
-    _configure_git_gh_ssh_and_auth_step
+    _teemill_toolchain_apply_setups "$selected_tools_line" "$dry_run"
 
     _teemill_install_major_step "Next: clone Teemill repositories over SSH"
     echo "" >&2
-    echo "teemill-install: clones use SSH (git@github.com:Teemill/…). Ensure your GitHub SSH key is loaded." >&2
+    echo "clones use SSH (git@github.com:Teemill/…). Ensure your GitHub SSH key is loaded." >&2
 
     return 0
   fi
@@ -1467,52 +1415,50 @@ bootstrap_environment() {
   fi
 
   if _selected_line_contains_tool_id "$selected_tools_line" "curl" && ! command -v curl >/dev/null 2>&1; then
-    echo "teemill-install: curl is still not on PATH after install attempt." >&2
+    echo "curl is still not on PATH after install attempt." >&2
     exit 2
   fi
 
   if _selected_line_contains_tool_id "$selected_tools_line" "git" && ! command -v git >/dev/null 2>&1; then
-    echo "teemill-install: git is still not on PATH after install attempt." >&2
+    echo "git is still not on PATH after install attempt." >&2
     exit 2
   fi
 
   if _selected_line_contains_tool_id "$selected_tools_line" "gh" && ! command -v gh >/dev/null 2>&1; then
-    echo "teemill-install: gh is still not on PATH after install attempt." >&2
+    echo "gh is still not on PATH after install attempt." >&2
     exit 2
   fi
 
   if _selected_line_contains_tool_id "$selected_tools_line" "gcloud" && ! command -v gcloud >/dev/null 2>&1; then
-    echo "teemill-install: gcloud is still not on PATH after install attempt." >&2
+    echo "gcloud is still not on PATH after install attempt." >&2
     exit 2
   fi
 
   if _selected_line_contains_tool_id "$selected_tools_line" "docker" && ! command -v docker >/dev/null 2>&1; then
-    echo "teemill-install: docker is still not on PATH after install attempt." >&2
+    echo "docker is still not on PATH after install attempt." >&2
     exit 2
   fi
 
   if _selected_line_contains_tool_id "$selected_tools_line" "kubectl" && ! command -v kubectl >/dev/null 2>&1; then
-    echo "teemill-install: kubectl is still not on PATH after install attempt." >&2
+    echo "kubectl is still not on PATH after install attempt." >&2
     exit 2
   fi
 
   if _selected_line_contains_tool_id "$selected_tools_line" "helm" && ! command -v helm >/dev/null 2>&1; then
-    echo "teemill-install: helm is still not on PATH after install attempt." >&2
+    echo "helm is still not on PATH after install attempt." >&2
     exit 2
   fi
 
   if _selected_line_contains_tool_id "$selected_tools_line" "terraform" && ! command -v terraform >/dev/null 2>&1; then
-    echo "teemill-install: terraform is still not on PATH after install attempt." >&2
+    echo "terraform is still not on PATH after install attempt." >&2
     exit 2
   fi
 
-  _run_gcloud_auth_login_step
-
-  _configure_git_gh_ssh_and_auth_step
+  _teemill_toolchain_apply_setups "$selected_tools_line" "$dry_run"
 
   _teemill_install_major_step "Next: clone Teemill repositories over SSH"
   echo "" >&2
-  echo "teemill-install: clones use SSH (git@github.com:Teemill/…). Ensure your GitHub SSH key is loaded." >&2
+  echo "clones use SSH (git@github.com:Teemill/…). Ensure your GitHub SSH key is loaded." >&2
 }
 
 # Repositories offered. Format:
@@ -1554,6 +1500,9 @@ usage() {
 Usage: install [options]
   (local file: bash path/to/install   remote: curl ... | bash -s -- [options])
 
+  Toolchain packages install only on Debian/Ubuntu (apt). Clones and git/gh setup can still run elsewhere if you
+  skip the toolchain step or already have the tools on PATH.
+
   Clones Teemill repos into ~/teemill (created if missing). First pick toolchain packages (defaults:
   curl, git, gh, gcloud, docker; optional: kubectl, helm, terraform) using the same arrow/Space menu as
   repos (numbered fallback without a TTY). Toolchain and repo pickers show [✓] when already present
@@ -1565,7 +1514,7 @@ Usage: install [options]
   available (otherwise prints a reminder to run it manually). Skipped under --dry-run.
 
   Then configures GitHub over SSH for git/gh: default SSH key (or optional interactive
-  ssh-keygen), ssh-add / macOS Keychain, Linux ~/.ssh/config Host github.com hints, gh
+  ssh-keygen), ssh-add / macOS Keychain when on macOS, Linux ~/.ssh/config Host github.com hints, gh
   git_protocol ssh, gh auth login + setup-git when needed, and git user.name / user.email
   from your GitHub login when unset (noreply email).
 
@@ -1593,8 +1542,10 @@ Environment:
   TEEMILL_DEBUG  Set to 1 for extra stderr when Ubuntu dock favorites are skipped
 
 Dependencies:
-  sudo on Linux when not root (package installs and adding your user to the docker group). Upstream version checks use curl when present, otherwise wget.
-  Docker on Linux is the distro docker.io / docker package; the script adds your login user to the docker group so docker(1) can use the socket without sudo after you re-login or run newgrp docker. macOS uses brew install docker when Homebrew is available.
+  Debian or Ubuntu with apt-get. sudo when not root (package installs and adding your user to the docker group).
+  Upstream version checks use curl when present, otherwise wget.
+  Docker uses the distro docker.io package; the script adds your login user to the docker group so docker(1)
+  can use the socket without sudo after you re-login or run newgrp docker.
   After toolchain install (or if gcloud is already on PATH), gcloud auth login when appropriate, then git/gh + GitHub SSH + gh auth when a TTY allows it.
 EOF
 }
@@ -2051,7 +2002,7 @@ prompt_repo_ids_cli() {
   done < <(parse_manifest_lines)
 
   if [[ "${#manifest_lines[@]}" -eq 0 ]]; then
-    echo "teemill-install: internal error: empty manifest." >&2
+    echo "internal error: empty manifest." >&2
     exit 2
   fi
 
@@ -2237,7 +2188,7 @@ prompt_toggle_ids_fallback_numbers() {
       fi
 
       if [[ "$end" -gt "$count" ]] || [[ "$start" -lt 1 ]]; then
-        echo "teemill-install: range out of bounds: $token (valid 1-$count)" >&2
+        echo "range out of bounds: $token (valid 1-$count)" >&2
         exit 2
       fi
 
@@ -2250,7 +2201,7 @@ prompt_toggle_ids_fallback_numbers() {
 
     if [[ "$token" =~ ^[1-9][0-9]*$ ]]; then
       if [[ "$token" -lt 1 ]] || [[ "$token" -gt "$count" ]]; then
-        echo "teemill-install: index out of bounds: $token (valid 1-$count)" >&2
+        echo "index out of bounds: $token (valid 1-$count)" >&2
         exit 2
       fi
 
@@ -2258,7 +2209,7 @@ prompt_toggle_ids_fallback_numbers() {
       continue
     fi
 
-    echo "teemill-install: could not parse token: $token (use numbers, ranges, all, or none)" >&2
+    echo "could not parse token: $token (use numbers, ranges, all, or none)" >&2
     exit 2
   done
 
@@ -2344,7 +2295,7 @@ prompt_tool_ids_cli() {
   done < <(parse_tool_manifest_lines)
 
   if [[ "${#manifest_lines[@]}" -eq 0 ]]; then
-    echo "teemill-install: internal error: empty tool manifest." >&2
+    echo "internal error: empty tool manifest." >&2
     exit 2
   fi
 
@@ -2374,7 +2325,7 @@ main() {
         teemill_root="${2:-}"
 
         if [[ -z "$teemill_root" ]]; then
-          echo "teemill-install: --root needs a directory argument." >&2
+          echo "--root needs a directory argument." >&2
           exit 2
         fi
 
@@ -2407,7 +2358,7 @@ main() {
         exit 0
         ;;
       *)
-        echo "teemill-install: unknown option: $1" >&2
+        echo "unknown option: $1" >&2
         usage >&2
         exit 2
         ;;
@@ -2451,11 +2402,11 @@ main() {
   fi
 
   if [[ "${#chosen_ids[@]}" -eq 0 ]]; then
-    echo "teemill-install: nothing selected; exiting." >&2
+    echo "nothing selected; exiting." >&2
     exit 0
   fi
 
-  local chosen match_line url dest_path
+  local chosen match_line id url dest_path
 
   for chosen in "${chosen_ids[@]}"; do
     [[ -z "$chosen" ]] && continue
@@ -2463,6 +2414,7 @@ main() {
     match_line=""
 
     while IFS= read -r manifest_line; do
+      [[ -z "$manifest_line" ]] && continue
       id="$(manifest_field "$manifest_line" 1)"
 
       if [[ "$id" == "$chosen" ]]; then
@@ -2472,40 +2424,31 @@ main() {
     done < <(parse_manifest_lines)
 
     if [[ -z "$match_line" ]]; then
-      echo "teemill-install: unknown repo id from selection: $chosen" >&2
+      echo "unknown repo id from selection: $chosen" >&2
       exit 2
     fi
 
     url="$(manifest_field "$match_line" 3)"
     dest_path="$(manifest_clone_target_path "$teemill_root" "$match_line")"
 
-    if is_manifest_repo_installed "$teemill_root" "$match_line"; then
-      echo "teemill-install: skip (already a git repo): $(manifest_clone_target_path "$teemill_root" "$match_line")" >&2
-      continue
-    fi
-
-    if [[ -e "$dest_path" ]]; then
-      echo "teemill-install: skip (path exists and is not an empty git clone target): $dest_path" >&2
-      continue
-    fi
-
-    # frontend + frontend-legacy share a large tree; partial clone keeps initial fetch small.
-    local clone_cmd=(git clone)
-
-    if [[ "$chosen" == "frontend" || "$chosen" == "frontend-legacy" ]]; then
-      clone_cmd+=(--filter=blob:none)
-    fi
-
-    clone_cmd+=("$url" "$dest_path")
-
     if [[ "$dry_run" == "true" ]]; then
+      local clone_cmd=(git clone)
+
+      if [[ "$chosen" == "frontend" || "$chosen" == "frontend-legacy" ]]; then
+        clone_cmd+=(--filter=blob:none)
+      fi
+
+      clone_cmd+=("$url" "$dest_path")
       printf '%q ' "${clone_cmd[@]}"
       echo
       continue
     fi
 
-    echo "teemill-install: cloning $chosen -> $dest_path" >&2
-    "${clone_cmd[@]}"
+    if ! _install_repo "$teemill_root" "$chosen"; then
+      exit 2
+    fi
+
+    _setup_repo "$teemill_root" "$chosen" || true
   done
 }
 
