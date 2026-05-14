@@ -6,15 +6,15 @@
 # Space toggles, Enter confirms; numbered fallback): defaults on for curl, git, gh, gcloud, docker;
 # kubectl, helm, and terraform are optional (off by default). Shows a version summary for selected tools,
 # then installs (Debian uses docker.io from default repos, not Docker CE). --yes skips prompts and uses
-# default toolchain ids plus default repo clone set. --dry-run prints resolved toolchain package names,
-# IDE install plan, browser install hints when those phases run, and git clone commands instead of mutating the system.
+# default toolchain ids plus default repo clone set. --dry-run prints resolved toolchain package names
+# and git clone commands instead of mutating the system.
 # gcloud auth login runs when gcloud is among selected tools; git/gh + GitHub SSH + gh login follow when
-# a TTY allows it. Optional Cursor / JetBrains Toolbox install follows toolchain (1/2/3 menu on /dev/tty; --yes: Cursor).
-# Optional Firefox / Google Chrome installs share the same picker pattern as repos.
+# a TTY allows it.
 # On Ubuntu (strict ID=ubuntu from /etc/os-release) with GNOME Shell, optionally resets the dock favorites
-# to default browser + chosen IDE + terminal via gsettings (org.gnome.shell favorite-apps) after optional
-# Cursor or JetBrains Toolbox install (bounded network; --yes defaults to Cursor install + dock slot).
-# Interactive repo and browser lists: arrow keys move, Space toggles, Enter confirms.
+# to default browser + IDE + terminal via gsettings (org.gnome.shell favorite-apps) when those .desktop
+# entries can be resolved (browser from the desktop default, IDE from the first installed cursor.desktop or
+# jetbrains-toolbox.desktop when ide_choice is skip).
+# Interactive repo list: arrow keys move, Space toggles, Enter confirms.
 # Falls back to typing numbers if /dev/tty is not usable.
 #
 # Remote install (fresh machine; creates ~/teemill, then default toolchain + default repos with --yes):
@@ -30,8 +30,8 @@ trap '' PIPE
 readonly DEFAULT_TEEMILL_ROOT="${TEEMILL_ROOT:-$HOME/teemill}"
 
 # -----------------------------------------------------------------------------
-# Layout: shared helpers → toolchain (versions, dry-run, installers) → browsers →
-# gcloud / git+gh → IDE → Ubuntu GNOME dock → manifests → interactive menus → main.
+# Layout: shared helpers → toolchain (versions, dry-run, installers) →
+# gcloud / git+gh → Ubuntu GNOME dock → manifests → interactive menus → main.
 # -----------------------------------------------------------------------------
 
 # stderr: separate prior output from a major step (blank line + banner).
@@ -805,36 +805,6 @@ install_toolchain_for_platform() {
   return 1
 }
 
-is_browser_id_installed() {
-  case "$1" in
-    firefox)
-      command -v firefox >/dev/null 2>&1 && return 0
-      command -v firefox-esr >/dev/null 2>&1 && return 0
-      [[ -d "/Applications/Firefox.app" ]] && return 0
-
-      return 1
-      ;;
-    chrome)
-      command -v google-chrome-stable >/dev/null 2>&1 && return 0
-      command -v google-chrome >/dev/null 2>&1 && return 0
-      [[ -d "/Applications/Google Chrome.app" ]] && return 0
-
-      return 1
-      ;;
-    *)
-      return 1
-      ;;
-  esac
-}
-
-is_browser_manifest_line_installed() {
-  local _root="$1"
-  local manifest_line="$2"
-  local browser_id
-
-  browser_id="$(manifest_field "$manifest_line" 1)"
-  is_browser_id_installed "$browser_id"
-}
 
 _teemill_toggle_version_or_dash() {
   local value="${1:-}"
@@ -921,72 +891,6 @@ _teemill_toggle_toolchain_target_version() {
   _teemill_toggle_version_or_dash "$raw"
 }
 
-_teemill_toggle_browser_installed_version() {
-  local _root="$1"
-  local manifest_line="$2"
-  local browser_id raw line
-
-  browser_id="$(manifest_field "$manifest_line" 1)"
-  raw=""
-
-  case "$browser_id" in
-    firefox)
-      line="$({ firefox --version 2>/dev/null || firefox-esr --version 2>/dev/null || true; } | head -n1)"
-      raw="$(echo "$line" | sed -E 's/.* ([0-9][0-9.]*).*/\1/')"
-      ;;
-    chrome)
-      line="$({ google-chrome-stable --version 2>/dev/null || google-chrome --version 2>/dev/null || true; } | head -n1)"
-      raw="$(echo "$line" | sed -E 's/.* ([0-9][0-9.]*).*/\1/')"
-      ;;
-  esac
-
-  if [[ "$browser_id" == "firefox" ]] && [[ -z "${raw// }" ]] && [[ -d "/Applications/Firefox.app" ]]; then
-    raw="(app)"
-  fi
-
-  if [[ "$browser_id" == "chrome" ]] && [[ -z "${raw// }" ]] && [[ -d "/Applications/Google Chrome.app" ]]; then
-    raw="(app)"
-  fi
-
-  _teemill_toggle_version_or_dash "$raw"
-}
-
-_teemill_toggle_browser_target_version() {
-  local _root="$1"
-  local manifest_line="$2"
-  local browser_id candidate
-
-  browser_id="$(manifest_field "$manifest_line" 1)"
-
-  if command -v apt-cache >/dev/null 2>&1; then
-    case "$browser_id" in
-      firefox)
-        candidate="$(apt-cache policy firefox 2>/dev/null | sed -n 's/^  Candidate: \(.\{1,80\}\)$/\1/p' | head -n1)"
-        ;;
-      chrome)
-        candidate="$(apt-cache policy google-chrome-stable 2>/dev/null | sed -n 's/^  Candidate: \(.\{1,80\}\)$/\1/p' | head -n1)"
-        ;;
-    esac
-
-    if [[ -n "${candidate:-}" && "$candidate" != "(none)" ]]; then
-      _teemill_toggle_version_or_dash "$candidate"
-
-      return
-    fi
-  fi
-
-  if [[ "$(uname -s)" == "Darwin" ]] && command -v brew >/dev/null 2>&1; then
-    case "$browser_id" in
-      firefox | chrome)
-        printf 'brew-cask'
-
-        return
-        ;;
-    esac
-  fi
-
-  printf 'pkg-feed'
-}
 
 _teemill_toggle_repo_installed_version() {
   local teemill_root="$1"
@@ -1024,434 +928,6 @@ _teemill_toggle_repo_target_version() {
   _teemill_toggle_version_or_dash "$head"
 }
 
-_debian_ensure_google_chrome_apt_repo() {
-  local chrome_list=/etc/apt/sources.list.d/google-chrome-teemill.list
-  local chrome_key=/usr/share/keyrings/google-chrome-linux-teemill.gpg
-  local arch=""
-
-  if [[ -f "$chrome_list" ]]; then
-    return 0
-  fi
-
-  if ! command -v dpkg >/dev/null 2>&1; then
-    echo "teemill-install: Google Chrome apt setup requires dpkg (Debian/Ubuntu)." >&2
-
-    return 1
-  fi
-
-  arch="$(dpkg --print-architecture)"
-
-  if [[ "$arch" != "amd64" ]]; then
-    echo "teemill-install: Google Chrome official .deb repo is amd64-only (this system: ${arch}); skipping Chrome apt setup." >&2
-
-    return 1
-  fi
-
-  if ! command -v curl >/dev/null 2>&1; then
-    echo "teemill-install: need curl to add the Google Chrome apt signing key." >&2
-
-    return 1
-  fi
-
-  curl -fsSL https://dl.google.com/linux/linux_signing_key.pub | _pkg_as_root gpg --batch --yes --dearmor -o "$chrome_key"
-  _pkg_as_root chmod go+r "$chrome_key" 2>/dev/null || true
-  echo "deb [arch=${arch} signed-by=${chrome_key}] https://dl.google.com/linux/chrome/deb/ stable main" | _pkg_as_root tee "$chrome_list" >/dev/null
-  _pkg_as_root apt-get update -qq
-}
-
-_install_browsers_debian() {
-  export DEBIAN_FRONTEND=noninteractive
-  local browser_id
-
-  for browser_id in "$@"; do
-    case "$browser_id" in
-      firefox)
-        if is_browser_id_installed firefox; then
-          echo "teemill-install: Firefox already detected; skipping apt install firefox." >&2
-
-          continue
-        fi
-
-        _pkg_as_root apt-get update -qq
-        _pkg_as_root apt-get install -y -qq firefox
-        ;;
-      chrome)
-        if is_browser_id_installed chrome; then
-          echo "teemill-install: Google Chrome already detected; skipping apt install google-chrome-stable." >&2
-
-          continue
-        fi
-
-        if ! _debian_ensure_google_chrome_apt_repo; then
-          echo "teemill-install: Google Chrome apt install skipped (see messages above)." >&2
-
-          continue
-        fi
-
-        _pkg_as_root apt-get install -y -qq google-chrome-stable
-        ;;
-      *)
-        echo "teemill-install: unknown browser id for Debian: ${browser_id}" >&2
-        ;;
-    esac
-  done
-}
-
-_install_browsers_homebrew() {
-  local browser_id
-
-  if ! command -v brew >/dev/null 2>&1; then
-    echo "teemill-install: Homebrew not found; skipping browser installs (install https://brew.sh then re-run)." >&2
-
-    return 0
-  fi
-
-  for browser_id in "$@"; do
-    case "$browser_id" in
-      firefox)
-        if is_browser_id_installed firefox; then
-          echo "teemill-install: Firefox already detected; skipping brew cask firefox." >&2
-
-          continue
-        fi
-
-        brew install --cask firefox 2>/dev/null || brew upgrade --cask firefox
-        ;;
-      chrome)
-        if is_browser_id_installed chrome; then
-          echo "teemill-install: Google Chrome already detected; skipping brew cask google-chrome." >&2
-
-          continue
-        fi
-
-        brew install --cask google-chrome 2>/dev/null || brew upgrade --cask google-chrome
-        ;;
-      *)
-        echo "teemill-install: unknown browser id for Homebrew: ${browser_id}" >&2
-        ;;
-    esac
-  done
-}
-
-_install_browsers_dnf() {
-  local browser_id
-
-  for browser_id in "$@"; do
-    case "$browser_id" in
-      firefox)
-        if is_browser_id_installed firefox; then
-          echo "teemill-install: Firefox already detected; skipping dnf install firefox." >&2
-
-          continue
-        fi
-
-        _pkg_as_root dnf install -y firefox
-        ;;
-      chrome)
-        if is_browser_id_installed chrome; then
-          echo "teemill-install: Google Chrome already detected; skipping dnf install google-chrome-stable." >&2
-
-          continue
-        fi
-
-        if _pkg_as_root dnf install -y google-chrome-stable 2>/dev/null; then
-          :
-        else
-          echo "teemill-install: dnf: google-chrome-stable is not in enabled repos; install Chrome from https://www.google.com/chrome/ or add Google's repo, then re-run." >&2
-        fi
-        ;;
-      *)
-        echo "teemill-install: unknown browser id for dnf: ${browser_id}" >&2
-        ;;
-    esac
-  done
-}
-
-_install_browsers_yum() {
-  local browser_id
-
-  for browser_id in "$@"; do
-    case "$browser_id" in
-      firefox)
-        if is_browser_id_installed firefox; then
-          echo "teemill-install: Firefox already detected; skipping yum install firefox." >&2
-
-          continue
-        fi
-
-        _pkg_as_root yum install -y -q firefox || true
-        ;;
-      chrome)
-        if is_browser_id_installed chrome; then
-          echo "teemill-install: Google Chrome already detected; skipping yum install google-chrome-stable." >&2
-
-          continue
-        fi
-
-        if _pkg_as_root yum install -y -q google-chrome-stable 2>/dev/null; then
-          :
-        else
-          echo "teemill-install: yum: google-chrome-stable not available; install Chrome from vendor docs or skip." >&2
-        fi
-        ;;
-      *)
-        echo "teemill-install: unknown browser id for yum: ${browser_id}" >&2
-        ;;
-    esac
-  done
-}
-
-_install_browsers_zypper() {
-  local browser_id
-
-  for browser_id in "$@"; do
-    case "$browser_id" in
-      firefox)
-        if is_browser_id_installed firefox; then
-          echo "teemill-install: Firefox already detected; skipping zypper firefox." >&2
-
-          continue
-        fi
-
-        _pkg_as_root zypper --non-interactive install -y firefox 2>/dev/null || true
-        ;;
-      chrome)
-        if is_browser_id_installed chrome; then
-          echo "teemill-install: Google Chrome already detected; skipping zypper google-chrome-stable." >&2
-
-          continue
-        fi
-
-        if _pkg_as_root zypper --non-interactive install -y google-chrome-stable 2>/dev/null; then
-          :
-        else
-          echo "teemill-install: zypper: google-chrome-stable not available; install Chrome from https://www.google.com/chrome/ or skip." >&2
-        fi
-        ;;
-      *)
-        echo "teemill-install: unknown browser id for zypper: ${browser_id}" >&2
-        ;;
-    esac
-  done
-}
-
-_install_browsers_pacman() {
-  local browser_id
-
-  for browser_id in "$@"; do
-    case "$browser_id" in
-      firefox)
-        if is_browser_id_installed firefox; then
-          echo "teemill-install: Firefox already detected; skipping pacman firefox." >&2
-
-          continue
-        fi
-
-        _pkg_as_root pacman -S --noconfirm --needed firefox
-        ;;
-      chrome)
-        if is_browser_id_installed chrome; then
-          echo "teemill-install: Google Chrome already detected; skipping." >&2
-
-          continue
-        fi
-
-        echo "teemill-install: pacman: Google Chrome is not in core repos (use AUR or skip); not installing chrome." >&2
-        ;;
-      *)
-        echo "teemill-install: unknown browser id for pacman: ${browser_id}" >&2
-        ;;
-    esac
-  done
-}
-
-_install_browsers_apk() {
-  local browser_id
-
-  for browser_id in "$@"; do
-    case "$browser_id" in
-      firefox)
-        if is_browser_id_installed firefox; then
-          echo "teemill-install: Firefox already detected; skipping apk firefox." >&2
-
-          continue
-        fi
-
-        if _pkg_as_root apk add --no-cache firefox 2>/dev/null; then
-          :
-        else
-          echo "teemill-install: apk: firefox package not available on this mirror; skip or install manually." >&2
-        fi
-        ;;
-      chrome)
-        echo "teemill-install: apk: Google Chrome is not packaged here; skipping chrome." >&2
-        ;;
-      *)
-        echo "teemill-install: unknown browser id for apk: ${browser_id}" >&2
-        ;;
-    esac
-  done
-}
-
-install_browsers_for_platform() {
-  if [[ $# -eq 0 ]]; then
-    return 0
-  fi
-
-  if [[ "$(uname -s)" == "Darwin" ]] && command -v brew >/dev/null 2>&1; then
-    _install_browsers_homebrew "$@"
-    return
-  fi
-
-  if command -v apt-get >/dev/null 2>&1; then
-    _install_browsers_debian "$@"
-    return
-  fi
-
-  if command -v dnf >/dev/null 2>&1; then
-    _install_browsers_dnf "$@"
-    return
-  fi
-
-  if command -v yum >/dev/null 2>&1; then
-    _install_browsers_yum "$@"
-    return
-  fi
-
-  if command -v zypper >/dev/null 2>&1; then
-    _install_browsers_zypper "$@"
-    return
-  fi
-
-  if command -v pacman >/dev/null 2>&1; then
-    _install_browsers_pacman "$@"
-    return
-  fi
-
-  if command -v apk >/dev/null 2>&1; then
-    _install_browsers_apk "$@"
-    return
-  fi
-
-  echo "teemill-install: no supported package manager for browser installs; install Firefox/Chrome manually." >&2
-
-  return 0
-}
-
-_print_browser_install_dry_run() {
-  local browser_id
-
-  _teemill_install_major_step "Dry-run: browser install details"
-  echo "" >&2
-  echo "teemill-install: (--dry-run) selected browser ids: $*" >&2
-  echo "teemill-install: (--dry-run) install commands / package names for this host:" >&2
-
-  if [[ "$(uname -s)" == "Darwin" ]] && command -v brew >/dev/null 2>&1; then
-    for browser_id in "$@"; do
-      case "$browser_id" in
-        firefox) echo "  brew install --cask firefox    # cask: firefox" >&2 ;;
-        chrome) echo "  brew install --cask google-chrome    # cask: google-chrome" >&2 ;;
-      esac
-    done
-
-    return
-  fi
-
-  if command -v apt-get >/dev/null 2>&1; then
-    for browser_id in "$@"; do
-      case "$browser_id" in
-        firefox) echo "  apt-get install -y firefox    # package: firefox" >&2 ;;
-        chrome)
-          echo "  (add https://dl.google.com/linux/chrome/deb/ with signed-by keyring) apt-get install -y google-chrome-stable    # package: google-chrome-stable" >&2
-          ;;
-      esac
-    done
-
-    return
-  fi
-
-  if command -v dnf >/dev/null 2>&1; then
-    for browser_id in "$@"; do
-      case "$browser_id" in
-        firefox) echo "  dnf install -y firefox" >&2 ;;
-        chrome) echo "  dnf install -y google-chrome-stable    # may require Google's repo" >&2 ;;
-      esac
-    done
-
-    return
-  fi
-
-  if command -v yum >/dev/null 2>&1; then
-    for browser_id in "$@"; do
-      case "$browser_id" in
-        firefox) echo "  yum install -y firefox" >&2 ;;
-        chrome) echo "  yum install -y google-chrome-stable    # may require Google's repo" >&2 ;;
-      esac
-    done
-
-    return
-  fi
-
-  if command -v zypper >/dev/null 2>&1; then
-    for browser_id in "$@"; do
-      case "$browser_id" in
-        firefox) echo "  zypper install -y firefox" >&2 ;;
-        chrome) echo "  zypper install -y google-chrome-stable    # may be unavailable" >&2 ;;
-      esac
-    done
-
-    return
-  fi
-
-  if command -v pacman >/dev/null 2>&1; then
-    for browser_id in "$@"; do
-      case "$browser_id" in
-        firefox) echo "  pacman -S firefox    # package: firefox" >&2 ;;
-        chrome) echo "  (no official google-chrome in core repos; AUR or skip)" >&2 ;;
-      esac
-    done
-
-    return
-  fi
-
-  if command -v apk >/dev/null 2>&1; then
-    for browser_id in "$@"; do
-      case "$browser_id" in
-        firefox) echo "  apk add firefox    # if available on this Alpine mirror" >&2 ;;
-        chrome) echo "  (Google Chrome not available via apk; skip or use Chromium manually)" >&2 ;;
-      esac
-    done
-
-    return
-  fi
-
-  echo "  (no recognized package manager: install browsers manually)" >&2
-}
-
-_run_browser_install_phase() {
-  local assume_yes="$1"
-  local dry_run="$2"
-  local -a chosen_browser_ids=()
-
-  _teemill_install_major_step "Optional browsers: Firefox / Google Chrome"
-  echo "" >&2
-
-  mapfile -t chosen_browser_ids < <(prompt_browser_ids_cli "$assume_yes")
-
-  if [[ "${#chosen_browser_ids[@]}" -eq 0 ]]; then
-    echo "teemill-install: no browsers selected for install." >&2
-
-    return 0
-  fi
-
-  if [[ "$dry_run" == "true" ]]; then
-    _print_browser_install_dry_run "${chosen_browser_ids[@]}"
-
-    return 0
-  fi
-
-  install_browsers_for_platform "${chosen_browser_ids[@]}" || true
-}
 
 _run_gcloud_auth_login_step() {
   local active_account
@@ -1768,7 +1244,7 @@ _teemill_resolve_primary_ide_desktop_basename() {
       echo "teemill-install: warning: jetbrains-toolbox.desktop not found; trying other IDE .desktop files for dock." >&2
       ;;
     skip)
-      echo "teemill-install: warning: IDE step skipped; picking first available IDE .desktop for dock." >&2
+      echo "teemill-install: note: picking first available IDE .desktop for dock (no IDE install step)." >&2
       ;;
     *)
       echo "teemill-install: warning: unknown IDE id '${ide_choice}'; picking first available IDE .desktop for dock." >&2
@@ -1805,662 +1281,6 @@ _teemill_resolve_terminal_desktop_basename() {
   printf ''
 }
 
-_teemill_print_ide_status_for_prompt() {
-  local line tb candidate
-
-  echo "  Cursor:" >&2
-
-  if command -v cursor >/dev/null 2>&1; then
-    line="$(cursor --version 2>/dev/null | head -n1 || true)"
-    echo "    on PATH${line:+  $line}" >&2
-  elif _is_cursor_user_install_present; then
-    echo "    user AppImage at ~/.local/share/teemill-cursor/Cursor.AppImage" >&2
-  elif [[ -d "/Applications/Cursor.app" ]]; then
-    line="$("/Applications/Cursor.app/Contents/MacOS/Cursor" --version 2>/dev/null | head -n1 || true)"
-    echo "    macOS app${line:+  $line}" >&2
-  else
-    echo "    not detected" >&2
-  fi
-
-  echo "    target: vendor download or brew --cask (install step)" >&2
-
-  echo "  JetBrains Toolbox:" >&2
-
-  if _is_jetbrains_toolbox_user_binary_present; then
-    for candidate in \
-      "${HOME}/.local/bin/jetbrains-toolbox" \
-      "${HOME}/.local/share/teemill-jetbrains-toolbox/jetbrains-toolbox" \
-      "${HOME}/Applications/jetbrains-toolbox/jetbrains-toolbox"; do
-      if [[ -x "$candidate" ]]; then
-        tb="$("$candidate" --version 2>/dev/null | head -n1 || true)"
-        echo "    ${candidate/#$HOME/\~}${tb:+  $tb}" >&2
-
-        break
-      fi
-    done
-  elif command -v brew >/dev/null 2>&1 && brew list --cask jetbrains-toolbox &>/dev/null; then
-    echo "    Homebrew cask jetbrains-toolbox" >&2
-  else
-    echo "    not detected" >&2
-  fi
-
-  echo "    target: JetBrains releases API + tarball (install step)" >&2
-}
-
-# Prints cursor | jetbrains-toolbox | skip on stdout. assume_yes=true skips the prompt (defaults to cursor).
-prompt_teemill_primary_ide() {
-  local assume_yes="${1:-false}"
-  local reply=""
-
-  if [[ "$assume_yes" == "true" ]]; then
-    printf '%s' "cursor"
-    return 0
-  fi
-
-  if [[ ! -r /dev/tty ]] || [[ ! -w /dev/tty ]]; then
-    echo "teemill-install: warning: no /dev/tty for IDE choice; defaulting to cursor for Ubuntu dock mapping." >&2
-    printf '%s' "cursor"
-    return 0
-  fi
-
-  _teemill_install_major_step "Primary IDE: status and choice"
-  echo "" >&2
-  _teemill_print_ide_status_for_prompt
-  echo "" >&2
-  printf '  1) Cursor  2) JetBrains Toolbox  3) Skip  [1] ' >&2
-  read -r reply </dev/tty || reply=""
-
-  case "${reply,,}" in
-    1 | "" | cursor)
-      printf '%s' "cursor"
-      ;;
-    2 | jetbrains-toolbox | jetbrains | toolbox)
-      printf '%s' "jetbrains-toolbox"
-      ;;
-    3 | skip | n | no | none)
-      printf '%s' "skip"
-      ;;
-    *)
-      echo "teemill-install: warning: unrecognized IDE choice; defaulting to cursor for dock mapping." >&2
-      printf '%s' "cursor"
-      ;;
-  esac
-}
-
-# Bounded HTTP GET to a file. Returns 0 on success, 1 on failure (caller may ignore).
-_teemill_http_download_to_file() {
-  local url="$1"
-  local output_path="$2"
-  local connect_timeout="${3:-8}"
-  local max_time="${4:-120}"
-
-  if command -v curl >/dev/null 2>&1; then
-    curl -fL --connect-timeout "$connect_timeout" --max-time "$max_time" \
-      -o "$output_path" "$url" 2>/dev/null && return 0
-
-    return 1
-  fi
-
-  if command -v wget >/dev/null 2>&1; then
-    wget -qO "$output_path" --connect-timeout="$connect_timeout" --read-timeout="$max_time" \
-      --timeout="$((connect_timeout + max_time))" "$url" 2>/dev/null && return 0
-
-    return 1
-  fi
-
-  return 1
-}
-
-_teemill_cursor_linux_api_platform() {
-  local machine=""
-
-  machine="$(uname -m 2>/dev/null || echo "")"
-
-  case "$machine" in
-    x86_64)
-      printf '%s' "linux-x64"
-      ;;
-    aarch64 | arm64)
-      printf '%s' "linux-arm64"
-      ;;
-    *)
-      printf ''
-      ;;
-  esac
-}
-
-_teemill_select_toolbox_tarball_url_for_machine() {
-  local body="$1"
-  local machine="$2"
-  local urls=""
-  local picked=""
-
-  urls="$(echo "$body" | tr -d '\n' | grep -oE 'https://download\.jetbrains\.com/toolbox/jetbrains-toolbox-[^"]+\.tar\.gz' | sort -u)"
-
-  case "$machine" in
-    aarch64 | arm64)
-      picked="$(echo "$urls" | grep -Ei 'arm64|aarch' | head -n1)"
-      ;;
-    x86_64 | amd64 | i386 | i686)
-      picked="$(echo "$urls" | grep -Eiv 'arm64|aarch' | head -n1)"
-      ;;
-    *)
-      picked="$(echo "$urls" | head -n1)"
-      ;;
-  esac
-
-  if [[ -z "$picked" ]]; then
-    picked="$(echo "$urls" | head -n1)"
-  fi
-
-  if [[ -n "$picked" ]]; then
-    printf '%s' "$picked"
-    return 0
-  fi
-
-  return 1
-}
-
-_teemill_jetbrains_toolbox_linux_tar_url() {
-  local body=""
-  local url=""
-  local machine=""
-  local api="https://data.services.jetbrains.com/products/releases?code=TBA&latest=true&type=release&platform=linux"
-
-  body="$(_http_get_body "$api" 8 32)"
-
-  machine="$(uname -m 2>/dev/null || echo "")"
-
-  if url="$(_teemill_select_toolbox_tarball_url_for_machine "$body" "$machine")"; then
-    printf '%s' "$url"
-    return 0
-  fi
-
-  return 1
-}
-
-_teemill_jetbrains_toolbox_mac_tar_url() {
-  local body=""
-  local url=""
-  local machine=""
-  local api="https://data.services.jetbrains.com/products/releases?code=TBA&latest=true&type=release&platform=mac"
-
-  body="$(_http_get_body "$api" 8 32)"
-
-  machine="$(uname -m 2>/dev/null || echo "")"
-
-  if url="$(_teemill_select_toolbox_tarball_url_for_machine "$body" "$machine")"; then
-    printf '%s' "$url"
-    return 0
-  fi
-
-  return 1
-}
-
-_teemill_write_desktop_entry() {
-  local desktop_path="$1"
-  local name="$2"
-  local exec_path="$3"
-  local icon="${4:-}"
-
-  mkdir -p "$(dirname "$desktop_path")" || return 1
-
-  {
-    echo "[Desktop Entry]"
-    echo "Type=Application"
-    echo "Name=${name}"
-    echo "Exec=${exec_path}"
-    echo "Terminal=false"
-    echo "Categories=Development;IDE;"
-
-    if [[ -n "$icon" ]]; then
-      echo "Icon=${icon}"
-    fi
-  } >"$desktop_path" || return 1
-
-  chmod 644 "$desktop_path" 2>/dev/null || true
-
-  if command -v update-desktop-database >/dev/null 2>&1; then
-    update-desktop-database "$(dirname "$desktop_path")" 2>/dev/null || true
-  fi
-
-  return 0
-}
-
-_is_cursor_user_install_present() {
-  [[ -x "${HOME}/.local/share/teemill-cursor/Cursor.AppImage" ]] && return 0
-
-  return 1
-}
-
-_is_jetbrains_toolbox_user_binary_present() {
-  local candidate=""
-
-  for candidate in \
-    "${HOME}/.local/share/teemill-jetbrains-toolbox/jetbrains-toolbox" \
-    "${HOME}/.local/bin/jetbrains-toolbox" \
-    "${HOME}/Applications/jetbrains-toolbox/jetbrains-toolbox"; do
-    if [[ -x "$candidate" ]]; then
-      return 0
-    fi
-  done
-
-  return 1
-}
-
-_install_primary_ide_cursor_macos() {
-  local manual_url="https://cursor.com/download"
-
-  if command -v cursor >/dev/null 2>&1 || [[ -d "/Applications/Cursor.app" ]]; then
-    echo "teemill-install: Cursor already present; skipping brew cask install." >&2
-
-    return 0
-  fi
-
-  if ! command -v brew >/dev/null 2>&1; then
-    echo "teemill-install: warning: Homebrew not found; install Cursor manually: ${manual_url}" >&2
-
-    return 0
-  fi
-
-  export HOMEBREW_NO_AUTO_UPDATE=1
-  export HOMEBREW_NO_INSTALL_CLEANUP=1
-
-  if command -v timeout >/dev/null 2>&1; then
-    if ! timeout 600 brew install --cask cursor; then
-      echo "teemill-install: warning: brew install --cask cursor failed or timed out (600s cap); try: ${manual_url}" >&2
-    fi
-  else
-    if ! brew install --cask cursor; then
-      echo "teemill-install: warning: brew install --cask cursor failed; try: ${manual_url}" >&2
-    fi
-  fi
-
-  return 0
-}
-
-_install_primary_ide_cursor_linux() {
-  local platform=""
-  local api_url=""
-  local dest_dir="${HOME}/.local/share/teemill-cursor"
-  local app_path="${dest_dir}/Cursor.AppImage"
-  local partial="${dest_dir}/.Cursor.AppImage.partial"
-  local manual_url="https://cursor.com/download"
-
-  if command -v cursor >/dev/null 2>&1 || _is_cursor_user_install_present; then
-    echo "teemill-install: Cursor already on PATH or under ~/.local/share/teemill-cursor; skipping download." >&2
-
-    return 0
-  fi
-
-  platform="$(_teemill_cursor_linux_api_platform)"
-
-  if [[ -z "$platform" ]]; then
-    echo "teemill-install: warning: unsupported CPU for Cursor Linux AppImage ($(uname -m 2>/dev/null)); install manually: ${manual_url}" >&2
-
-    return 0
-  fi
-
-  api_url="https://cursor.com/api/download?platform=${platform}&releaseTrack=latest"
-
-  mkdir -p "$dest_dir" "${HOME}/.local/bin" || {
-    echo "teemill-install: warning: could not create ${dest_dir}; install Cursor manually: ${manual_url}" >&2
-
-    return 0
-  }
-
-  rm -f "$partial" 2>/dev/null || true
-
-  if ! _teemill_http_download_to_file "$api_url" "$partial" 8 240; then
-    rm -f "$partial" 2>/dev/null || true
-    echo "teemill-install: warning: Cursor download failed (network or timeout); install manually: ${manual_url}" >&2
-
-    return 0
-  fi
-
-  if [[ ! -s "$partial" ]]; then
-    rm -f "$partial" 2>/dev/null || true
-    echo "teemill-install: warning: Cursor download was empty; install manually: ${manual_url}" >&2
-
-    return 0
-  fi
-
-  mv "$partial" "$app_path" || {
-    echo "teemill-install: warning: could not finalize Cursor.AppImage; install manually: ${manual_url}" >&2
-
-    return 0
-  }
-
-  chmod +x "$app_path" 2>/dev/null || true
-
-  ln -sf "$app_path" "${HOME}/.local/bin/cursor" 2>/dev/null || true
-
-  _teemill_write_desktop_entry \
-    "${HOME}/.local/share/applications/cursor.desktop" \
-    "Cursor" \
-    "$app_path" \
-    "cursor" || true
-
-  echo "teemill-install: Cursor AppImage installed at ${app_path} (symlink: ~/.local/bin/cursor). Ensure ~/.local/bin is on PATH." >&2
-
-  return 0
-}
-
-_install_primary_ide_toolbox_macos() {
-  local manual_url="https://www.jetbrains.com/toolbox-app/"
-  local tar_url=""
-  local dest_root="${HOME}/Applications/jetbrains-toolbox"
-  local partial=""
-  local unpack=""
-  local binary_path=""
-
-  if command -v jetbrains-toolbox >/dev/null 2>&1 || [[ -d "${HOME}/Applications/JetBrains Toolbox.app" ]]; then
-    echo "teemill-install: JetBrains Toolbox already present; skipping install." >&2
-
-    return 0
-  fi
-
-  if command -v brew >/dev/null 2>&1; then
-    export HOMEBREW_NO_AUTO_UPDATE=1
-    export HOMEBREW_NO_INSTALL_CLEANUP=1
-
-    if command -v timeout >/dev/null 2>&1; then
-      if timeout 600 brew install --cask jetbrains-toolbox; then
-        return 0
-      fi
-    else
-      if brew install --cask jetbrains-toolbox; then
-        return 0
-      fi
-    fi
-
-    echo "teemill-install: warning: brew cask jetbrains-toolbox unavailable or failed; trying bounded tarball download." >&2
-  fi
-
-  if ! tar_url="$(_teemill_jetbrains_toolbox_mac_tar_url)"; then
-    echo "teemill-install: warning: could not resolve JetBrains Toolbox macOS tarball URL; install manually: ${manual_url}" >&2
-
-    return 0
-  fi
-
-  mkdir -p "$dest_root" "${HOME}/.local/bin" || {
-    echo "teemill-install: warning: could not create ${dest_root}; install manually: ${manual_url}" >&2
-
-    return 0
-  }
-
-  partial="${dest_root}/.jetbrains-toolbox.partial.tar.gz"
-  unpack="${dest_root}/unpack"
-
-  rm -rf "$unpack" "$partial" 2>/dev/null || true
-  mkdir -p "$unpack" || return 0
-
-  if ! _teemill_http_download_to_file "$tar_url" "$partial" 8 240; then
-    rm -f "$partial" 2>/dev/null || true
-    echo "teemill-install: warning: JetBrains Toolbox download failed; install manually: ${manual_url}" >&2
-
-    return 0
-  fi
-
-  if ! tar -xzf "$partial" -C "$unpack" 2>/dev/null; then
-    echo "teemill-install: warning: could not unpack JetBrains Toolbox archive; install manually: ${manual_url}" >&2
-
-    rm -f "$partial" 2>/dev/null || true
-
-    return 0
-  fi
-
-  rm -f "$partial" 2>/dev/null || true
-
-  binary_path="$(find "$unpack" -maxdepth 4 -type f -name jetbrains-toolbox -perm -111 2>/dev/null | head -n1)"
-
-  if [[ -z "$binary_path" || ! -x "$binary_path" ]]; then
-    echo "teemill-install: warning: jetbrains-toolbox binary not found after unpack; install manually: ${manual_url}" >&2
-
-    rm -rf "$unpack" 2>/dev/null || true
-
-    return 0
-  fi
-
-  mv "$binary_path" "${dest_root}/jetbrains-toolbox" 2>/dev/null || cp "$binary_path" "${dest_root}/jetbrains-toolbox"
-  chmod +x "${dest_root}/jetbrains-toolbox" 2>/dev/null || true
-  rm -rf "$unpack" 2>/dev/null || true
-
-  ln -sf "${dest_root}/jetbrains-toolbox" "${HOME}/.local/bin/jetbrains-toolbox" 2>/dev/null || true
-
-  _teemill_write_desktop_entry \
-    "${HOME}/.local/share/applications/jetbrains-toolbox.desktop" \
-    "JetBrains Toolbox" \
-    "${dest_root}/jetbrains-toolbox" \
-    "jetbrains-toolbox" || true
-
-  echo "teemill-install: JetBrains Toolbox installed at ${dest_root}/jetbrains-toolbox (launch once to finish setup)." >&2
-
-  return 0
-}
-
-_install_primary_ide_toolbox_linux() {
-  local manual_url="https://www.jetbrains.com/toolbox-app/"
-  local tar_url=""
-  local dest_root="${HOME}/.local/share/teemill-jetbrains-toolbox"
-  local partial=""
-  local unpack=""
-  local binary_path=""
-
-  if command -v jetbrains-toolbox >/dev/null 2>&1 || _is_jetbrains_toolbox_user_binary_present; then
-    echo "teemill-install: JetBrains Toolbox already on PATH or under ~/.local; skipping download." >&2
-
-    return 0
-  fi
-
-  if ! tar_url="$(_teemill_jetbrains_toolbox_linux_tar_url)"; then
-    echo "teemill-install: warning: could not resolve JetBrains Toolbox Linux tarball URL; install manually: ${manual_url}" >&2
-
-    return 0
-  fi
-
-  mkdir -p "$dest_root" "${HOME}/.local/bin" || {
-    echo "teemill-install: warning: could not create ${dest_root}; install manually: ${manual_url}" >&2
-
-    return 0
-  }
-
-  partial="${dest_root}/.jetbrains-toolbox.partial.tar.gz"
-  unpack="${dest_root}/unpack"
-
-  rm -rf "$unpack" "$partial" 2>/dev/null || true
-  mkdir -p "$unpack" || return 0
-
-  if ! _teemill_http_download_to_file "$tar_url" "$partial" 8 240; then
-    rm -f "$partial" 2>/dev/null || true
-    echo "teemill-install: warning: JetBrains Toolbox download failed; install manually: ${manual_url}" >&2
-
-    return 0
-  fi
-
-  if ! tar -xzf "$partial" -C "$unpack" 2>/dev/null; then
-    echo "teemill-install: warning: could not unpack JetBrains Toolbox archive; install manually: ${manual_url}" >&2
-
-    rm -f "$partial" 2>/dev/null || true
-
-    return 0
-  fi
-
-  rm -f "$partial" 2>/dev/null || true
-
-  binary_path="$(find "$unpack" -maxdepth 4 -type f -name jetbrains-toolbox -perm -111 2>/dev/null | head -n1)"
-
-  if [[ -z "$binary_path" || ! -x "$binary_path" ]]; then
-    echo "teemill-install: warning: jetbrains-toolbox binary not found after unpack; install manually: ${manual_url}" >&2
-
-    rm -rf "$unpack" 2>/dev/null || true
-
-    return 0
-  fi
-
-  mv "$binary_path" "${dest_root}/jetbrains-toolbox" 2>/dev/null || cp "$binary_path" "${dest_root}/jetbrains-toolbox"
-  chmod +x "${dest_root}/jetbrains-toolbox" 2>/dev/null || true
-  rm -rf "$unpack" 2>/dev/null || true
-
-  ln -sf "${dest_root}/jetbrains-toolbox" "${HOME}/.local/bin/jetbrains-toolbox" 2>/dev/null || true
-
-  _teemill_write_desktop_entry \
-    "${HOME}/.local/share/applications/jetbrains-toolbox.desktop" \
-    "JetBrains Toolbox" \
-    "${dest_root}/jetbrains-toolbox" \
-    "jetbrains-toolbox" || true
-
-  echo "teemill-install: JetBrains Toolbox installed at ${dest_root}/jetbrains-toolbox (ensure ~/.local/bin is on PATH)." >&2
-
-  return 0
-}
-
-_print_primary_ide_install_dry_run() {
-  local choice="$1"
-  local platform=""
-
-  _teemill_install_major_step "Dry-run: primary IDE install plan (choice: ${choice})"
-  echo "" >&2
-
-  case "$choice" in
-    skip)
-      echo "teemill-install: (--dry-run) skip IDE install." >&2
-
-      return 0
-      ;;
-    cursor)
-      if [[ "$(uname -s)" == "Darwin" ]]; then
-        echo "teemill-install: (--dry-run) macOS: brew install --cask cursor   (600s timeout if timeout(1) exists)" >&2
-
-        return 0
-      fi
-
-      if [[ "$(uname -s)" != "Linux" ]]; then
-        echo "teemill-install: (--dry-run) non-Linux/non-macOS: IDE install skipped (manual: https://cursor.com/download)." >&2
-
-        return 0
-      fi
-
-      platform="$(_teemill_cursor_linux_api_platform)"
-
-      if [[ -z "$platform" ]]; then
-        echo "teemill-install: (--dry-run) Linux: unsupported CPU for Cursor; manual https://cursor.com/download" >&2
-
-        return 0
-      fi
-
-      echo "teemill-install: (--dry-run) Linux: curl/wget bounded download from https://cursor.com/api/download?platform=${platform}&releaseTrack=latest -> ~/.local/share/teemill-cursor/Cursor.AppImage (connect 8s, transfer up to 240s)" >&2
-
-      return 0
-      ;;
-    jetbrains-toolbox)
-      if [[ "$(uname -s)" == "Darwin" ]]; then
-        echo "teemill-install: (--dry-run) macOS: brew install --cask jetbrains-toolbox, else tarball from data.services.jetbrains.com (bounded curl, unpack under ~/Applications/jetbrains-toolbox)" >&2
-
-        return 0
-      fi
-
-      if [[ "$(uname -s)" != "Linux" ]]; then
-        echo "teemill-install: (--dry-run) non-Linux/non-macOS: JetBrains Toolbox skipped (manual: https://www.jetbrains.com/toolbox-app/)." >&2
-
-        return 0
-      fi
-
-      echo "teemill-install: (--dry-run) Linux: resolve tarball via data.services.jetbrains.com (curl connect 8s max 28s), download tar.gz (connect 8s, transfer up to 240s), unpack to ~/.local/share/teemill-jetbrains-toolbox" >&2
-
-      return 0
-      ;;
-    *)
-      echo "teemill-install: (--dry-run) unknown IDE id; no install action." >&2
-
-      return 0
-      ;;
-  esac
-}
-
-_install_primary_ide_for_platform() {
-  local choice="$1"
-  local uname_s=""
-
-  case "$choice" in
-    skip)
-      return 0
-      ;;
-    cursor | jetbrains-toolbox)
-      ;;
-    *)
-      echo "teemill-install: warning: unknown primary IDE id '${choice}'; skipping install." >&2
-
-      return 0
-      ;;
-  esac
-
-  uname_s="$(uname -s 2>/dev/null || echo "")"
-
-  if [[ "$uname_s" == "Darwin" ]]; then
-    case "$choice" in
-      cursor)
-        _install_primary_ide_cursor_macos
-        ;;
-      jetbrains-toolbox)
-        _install_primary_ide_toolbox_macos
-        ;;
-    esac
-
-    return 0
-  fi
-
-  if [[ "$uname_s" == "Linux" ]]; then
-    case "$choice" in
-      cursor)
-        _install_primary_ide_cursor_linux
-        ;;
-      jetbrains-toolbox)
-        _install_primary_ide_toolbox_linux
-        ;;
-    esac
-
-    return 0
-  fi
-
-  echo "teemill-install: warning: primary IDE auto-install is only implemented for macOS and Linux ($(uname_s)); install manually: https://cursor.com/download or https://www.jetbrains.com/toolbox-app/" >&2
-
-  return 0
-}
-
-# Sets TEEMILL_PRIMARY_IDE_CHOICE and installs IDE (unless dry-run). Always returns 0.
-_run_teemill_ide_prompt_and_install_phase() {
-  local assume_yes="${1:-false}"
-  local dry_run="${2:-false}"
-
-  TEEMILL_PRIMARY_IDE_CHOICE="$(prompt_teemill_primary_ide "$assume_yes")"
-
-  if [[ "$dry_run" == "true" ]]; then
-    _print_primary_ide_install_dry_run "$TEEMILL_PRIMARY_IDE_CHOICE"
-
-    return 0
-  fi
-
-  echo "" >&2
-
-  case "${TEEMILL_PRIMARY_IDE_CHOICE}" in
-    cursor)
-      echo "teemill-install: installing Cursor (best-effort; failures are warnings only)." >&2
-      ;;
-    jetbrains-toolbox)
-      echo "teemill-install: installing JetBrains Toolbox (best-effort; failures are warnings only)." >&2
-      ;;
-    skip)
-      echo "teemill-install: skipping IDE install (user chose skip)." >&2
-
-      return 0
-      ;;
-  esac
-
-  _install_primary_ide_for_platform "$TEEMILL_PRIMARY_IDE_CHOICE"
-
-  return 0
-}
 
 _teemill_ubuntu_gnome_favorites_can_use_gsettings() {
   command -v gsettings >/dev/null 2>&1 || return 1
@@ -2468,7 +1288,7 @@ _teemill_ubuntu_gnome_favorites_can_use_gsettings() {
 }
 
 # Ubuntu + GNOME Shell only: replace favorite-apps with browser, IDE, terminal when resolvable.
-# ide_choice: cursor | jetbrains-toolbox | skip (see prompt_teemill_primary_ide).
+# ide_choice: cursor | jetbrains-toolbox | skip (skip picks the first installed IDE .desktop for the dock).
 bootstrap_ubuntu_gnome_favorite_apps() {
   local ide_choice="${1:-skip}"
   local browser_desktop=""
@@ -2558,9 +1378,9 @@ bootstrap_ubuntu_gnome_favorite_apps() {
   echo "teemill-install: Ubuntu GNOME Shell dock favorites set to: ${favorites_list[*]}" >&2
 }
 
-# Creates workspace root, optional toolchain (multi-select), IDE prompt+install, optional browsers, then auth steps.
-# Pass dry_run true to print toolchain / IDE / browser plans without mutating (except mkdir workspace root).
-# selected_tools_line empty skips toolchain install but still runs IDE + browser phases.
+# Creates workspace root, optional toolchain (multi-select), then auth steps.
+# Pass dry_run true to print toolchain package plans without mutating (except mkdir workspace root).
+# selected_tools_line empty skips toolchain install and version summary.
 bootstrap_environment() {
   local workspace_root="$1"
   local assume_yes="${2:-false}"
@@ -2577,10 +1397,6 @@ bootstrap_environment() {
     echo "" >&2
     echo "teemill-install: no toolchain packages selected; skipping toolchain install and version summary." >&2
 
-    _run_teemill_ide_prompt_and_install_phase "$assume_yes" "$dry_run"
-
-    _run_browser_install_phase "$assume_yes" "$dry_run"
-
     _configure_git_gh_ssh_and_auth_step
 
     _teemill_install_major_step "Next: clone Teemill repositories over SSH"
@@ -2594,10 +1410,6 @@ bootstrap_environment() {
 
   if [[ "$dry_run" == "true" ]]; then
     _print_toolchain_dry_run_package_plan "$selected_tools_line"
-
-    _run_teemill_ide_prompt_and_install_phase "$assume_yes" "$dry_run"
-
-    _run_browser_install_phase "$assume_yes" "$dry_run"
 
     _configure_git_gh_ssh_and_auth_step
 
@@ -2655,10 +1467,6 @@ bootstrap_environment() {
     exit 2
   fi
 
-  _run_teemill_ide_prompt_and_install_phase "$assume_yes" "$dry_run"
-
-  _run_browser_install_phase "$assume_yes" "$dry_run"
-
   if _selected_line_contains_tool_id "$selected_tools_line" "gcloud"; then
     _run_gcloud_auth_login_step
   fi
@@ -2690,14 +1498,6 @@ infrastructure|Infrastructure|git@github.com:Teemill/infrastructure.git|
 # Space-separated repo ids chosen when you press Enter at the prompt.
 readonly DEFAULT_SELECTED_IDS="core-api frontend image-api"
 
-# Optional desktop browsers (id|label). Defaults: Firefox on, Chrome off (--yes uses these defaults).
-readonly BROWSER_MANIFEST='
-firefox|Mozilla Firefox
-chrome|Google Chrome
-'
-
-readonly DEFAULT_SELECTED_BROWSER_IDS="firefox"
-
 # Toolchain packages (id|description). Defaults: curl git gh gcloud docker; optional off by default: kubectl helm terraform.
 readonly TOOL_MANIFEST='
 curl|curl (HTTP client)|
@@ -2719,13 +1519,10 @@ Usage: install [options]
 
   Clones Teemill repos into ~/teemill (created if missing). First pick toolchain packages (defaults:
   curl, git, gh, gcloud, docker; optional: kubectl, helm, terraform) using the same arrow/Space menu as
-  repos (numbered fallback without a TTY). Toolchain, repo, and browser pickers show [✓] when already present
+  repos (numbered fallback without a TTY). Toolchain and repo pickers show [✓] when already present
   and two columns (installed -> target, best effort). A version summary is shown only for selected tools, then
-  packages are installed. Then pick a primary IDE (Cursor, JetBrains Toolbox, or skip) on /dev/tty; best-effort install
-  runs before optional browsers. Use --yes for non-interactive runs: default toolchain selection, default repo clone set,
-  default browser bundle, and default IDE (Cursor) without prompts.
-
-  Optional Firefox / Google Chrome installs use the same multi-select UX (--yes keeps Firefox on, Chrome off).
+  packages are installed. Use --yes for non-interactive runs: default toolchain selection and default repo clone set
+  without prompts.
 
   When gcloud is selected, runs gcloud auth login when there is no active gcloud account and a terminal is
   available (otherwise prints a reminder to run it manually).
@@ -2735,9 +1532,8 @@ Usage: install [options]
   git_protocol ssh, gh auth login + setup-git when needed, and git user.name / user.email
   from your GitHub login when unset (noreply email).
 
-  On Ubuntu (ID=ubuntu) with GNOME Shell, after the IDE step, may reset the dock to default browser + IDE +
-  terminal via gsettings (org.gnome.shell favorite-apps). IDE install: macOS Homebrew casks (bounded with
-  timeout(1) when available) or Linux time-bounded downloads (Cursor API; JetBrains Toolbox tarball).
+  On Ubuntu (ID=ubuntu) with GNOME Shell, may reset the dock to default browser + first detected IDE +
+  terminal via gsettings (org.gnome.shell favorite-apps) when those .desktop entries resolve.
 
   Clones use SSH (git@github.com:Teemill/…). The frontend and frontend-legacy ids use
   git clone --filter=blob:none. Ensure GitHub SSH auth works.
@@ -2750,8 +1546,8 @@ Remote (curl | bash):
 
 Options:
   --root DIR     Clone destination (default: ~/teemill or $TEEMILL_ROOT)
-  --yes, -y      Non-interactive: default toolchain ids, default repo clone set, default browser bundle, default IDE (Cursor)
-  --dry-run      Print selected toolchain package plan, IDE install plan, browser install hints, and git clone commands (no installs)
+  --yes, -y      Non-interactive: default toolchain ids and default repo clone set
+  --dry-run      Print selected toolchain package plan and git clone commands (no installs)
   --list         Print known repositories and exit
   -h, --help     Show this help
 
@@ -2762,8 +1558,7 @@ Environment:
 Dependencies:
   sudo on Linux when not root. Upstream version checks use curl when present, otherwise wget.
   Debian/Ubuntu Docker CLI comes from docker.io in default apt repos (no Docker CE repository).
-  After toolchain install, primary IDE install (when not skipped), optional Firefox / Google Chrome when selected,
-  then gcloud login when gcloud was selected, then git/gh + GitHub SSH + gh auth when a TTY allows it.
+  After toolchain install, gcloud login when gcloud was selected, then git/gh + GitHub SSH + gh auth when a TTY allows it.
 EOF
 }
 
@@ -2857,7 +1652,7 @@ read_menu_key() {
   printf 'NONE'
 }
 
-# Same TTY UX as repos / browsers; shows on-PATH tools with [✓] and installed vs upstream columns.
+# Same TTY UX as repos; shows on-PATH tools with [✓] and installed vs upstream columns.
 run_tool_arrow_menu() {
   local menu_status=0
 
@@ -3168,25 +1963,6 @@ run_repo_arrow_menu() {
   return "$menu_status"
 }
 
-run_browser_arrow_menu() {
-  local menu_status=0
-
-  TEEMILL_TOGGLE_VERSION_INSTALLED_FN=_teemill_toggle_browser_installed_version
-  TEEMILL_TOGGLE_VERSION_TARGET_FN=_teemill_toggle_browser_target_version
-
-  run_toggle_arrow_menu \
-    "Browsers (optional desktop)" \
-    $'  [✓] = already detected  |  columns: installed -> target (apt Candidate / brew-cask / feed)\n  ↑/↓ move   Space toggle   Enter confirm   q quit' \
-    "" \
-    is_browser_manifest_line_installed \
-    "$DEFAULT_SELECTED_BROWSER_IDS" \
-    "$@" || menu_status=$?
-
-  unset TEEMILL_TOGGLE_VERSION_INSTALLED_FN TEEMILL_TOGGLE_VERSION_TARGET_FN
-
-  return "$menu_status"
-}
-
 # HEREDOC-style manifest blocks: drop blank lines and #-comments.
 _teemill_manifest_non_comment_lines_from() {
   local raw="${1:?}"
@@ -3200,10 +1976,6 @@ parse_manifest_lines() {
 
 parse_tool_manifest_lines() {
   _teemill_manifest_non_comment_lines_from "$TOOL_MANIFEST"
-}
-
-parse_browser_manifest_lines() {
-  _teemill_manifest_non_comment_lines_from "$BROWSER_MANIFEST"
 }
 
 manifest_field() {
@@ -3485,69 +2257,6 @@ prompt_repo_ids_fallback_numbers() {
   unset TEEMILL_TOGGLE_VERSION_INSTALLED_FN TEEMILL_TOGGLE_VERSION_TARGET_FN
 }
 
-prompt_browser_ids_fallback_numbers() {
-  TEEMILL_TOGGLE_VERSION_INSTALLED_FN=_teemill_toggle_browser_installed_version
-  TEEMILL_TOGGLE_VERSION_TARGET_FN=_teemill_toggle_browser_target_version
-
-  prompt_toggle_ids_fallback_numbers \
-    "" \
-    "Browsers (optional)  (no TTY: type numbers instead of arrow keys)" \
-    is_browser_manifest_line_installed \
-    "$DEFAULT_SELECTED_BROWSER_IDS" \
-    "* = default install set (only browsers not already detected)." \
-    "[✓] = already installed (skipped for defaults, \"all\", and numbers)." \
-    "Which to install? [default bundle] " \
-    "$@"
-
-  unset TEEMILL_TOGGLE_VERSION_INSTALLED_FN TEEMILL_TOGGLE_VERSION_TARGET_FN
-}
-
-prompt_browser_ids_cli() {
-  local assume_yes="$1"
-  local -a manifest_lines=()
-  local manifest_line
-  local display_id
-
-  while IFS= read -r manifest_line; do
-    [[ -z "$manifest_line" ]] && continue
-    manifest_lines+=("$manifest_line")
-  done < <(parse_browser_manifest_lines)
-
-  if [[ "${#manifest_lines[@]}" -eq 0 ]]; then
-    echo "teemill-install: internal error: empty browser manifest." >&2
-    exit 2
-  fi
-
-  if [[ "$assume_yes" == "true" ]]; then
-    for manifest_line in "${manifest_lines[@]}"; do
-      display_id="$(manifest_field "$manifest_line" 1)"
-
-      if is_browser_manifest_line_installed "" "$manifest_line"; then
-        continue
-      fi
-
-      if is_id_in_default_list "$DEFAULT_SELECTED_BROWSER_IDS" "$display_id"; then
-        printf '%s\n' "$display_id"
-      fi
-    done
-
-    return
-  fi
-
-  if arrow_menu_tty_available; then
-    local menu_status=0
-
-    run_browser_arrow_menu "${manifest_lines[@]}" || menu_status=$?
-
-    if [[ "$menu_status" -eq 2 ]]; then
-      prompt_browser_ids_fallback_numbers "${manifest_lines[@]}"
-    fi
-
-    return
-  fi
-
-  prompt_browser_ids_fallback_numbers "${manifest_lines[@]}"
-}
 
 emit_default_repo_ids_for_teemill_root() {
   local teemill_root="$1"
@@ -3671,8 +2380,6 @@ main() {
   local selected_tools_line=""
   local -a selected_tool_ids_array=()
 
-  TEEMILL_PRIMARY_IDE_CHOICE="skip"
-
   if [[ "$assume_yes" == "true" ]]; then
     _teemill_install_major_step "Toolchain: defaults (--yes)"
     echo "" >&2
@@ -3684,7 +2391,7 @@ main() {
     selected_tools_line="${selected_tool_ids_array[*]}"
   fi
 
-  _teemill_install_major_step "Bootstrap: workspace, toolchain, IDE, browsers, auth"
+  _teemill_install_major_step "Bootstrap: workspace, toolchain, auth"
   echo "" >&2
 
   bootstrap_environment "$teemill_root" "$assume_yes" "$dry_run" "$selected_tools_line"
@@ -3693,7 +2400,7 @@ main() {
     teemill_root="$(cd -- "$teemill_root" && pwd)"
   fi
 
-  bootstrap_ubuntu_gnome_favorite_apps "${TEEMILL_PRIMARY_IDE_CHOICE:-skip}"
+  bootstrap_ubuntu_gnome_favorite_apps "skip"
 
   local -a chosen_ids=()
 
